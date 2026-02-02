@@ -1,29 +1,30 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
-  ArrowRight, Loader2, Star, Save, FileCode, ArrowLeft, Edit2, Search, 
-  Layers, ChevronLeft, History, RotateCw
+  ArrowRight, Loader2, Star, History, Save, FileCode, ArrowLeft, 
+  Edit2, Search, Layers, ChevronLeft
 } from 'lucide-react';
 import exifr from 'exifr';
 import JSZip from 'jszip';
-import { PhotoMission, PhotoAnalysis, PhotoMetadata, Project } from './types';
+import { PhotoMission, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
-const STORAGE_KEY = 'novus_cura_studio_original_fixed';
+const STORAGE_KEY = 'novus_cura_studio_hybrid_v1';
 
-// --- 1. SANITIZER: Fixes Rotation & Compresses for AI ---
+// --- ENGINE 1: Sanitizer (Fixes Rotation & Compresses to <1MB) ---
 const sanitizeAndCompress = (blob: Blob, orientation: number = 1): Promise<string> => {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(blob);
+    
     img.onload = () => {
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
-      const MAX_SIZE = 1024; // Perfect size for AI speed
+      const MAX_SIZE = 1024; // Resize for AI speed & Limit
       
       let width = img.width;
       let height = img.height;
 
-      // Swap dimensions if sideways (Orientation 5-8)
+      // Swap dimensions if rotated 90/270
       if (orientation > 4) { [width, height] = [height, width]; }
 
       const scale = Math.min(MAX_SIZE / width, MAX_SIZE / height, 1);
@@ -32,30 +33,29 @@ const sanitizeAndCompress = (blob: Blob, orientation: number = 1): Promise<strin
 
       if (!ctx) { reject(new Error("Canvas error")); return; }
 
-      // Standard Rotation Fix (Center Pivot)
+      // Standard Rotation Logic (Center Pivot)
       ctx.translate(canvas.width / 2, canvas.height / 2);
       switch (orientation) {
         case 3: ctx.rotate(Math.PI); break;
-        case 6: ctx.rotate(0.5 * Math.PI); break; // 90° CW
-        case 8: ctx.rotate(-0.5 * Math.PI); break; // 90° CCW
+        case 6: ctx.rotate(0.5 * Math.PI); break; // 90 CW
+        case 8: ctx.rotate(-0.5 * Math.PI); break; // 90 CCW
       }
       
-      // Draw Image Centered
-      // We draw it 'unscaled' first relative to the context, relying on canvas size constraints
+      // Draw centered
       const drawW = (orientation > 4 ? height : width) * scale;
       const drawH = (orientation > 4 ? width : height) * scale;
-      
       ctx.drawImage(img, -drawW/2, -drawH/2, drawW, drawH);
 
       const base64 = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
       resolve(base64);
       URL.revokeObjectURL(url);
     };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Image corrupt")); };
     img.src = url;
   });
 };
 
-// --- 2. EXTRACTOR: Finds Nikon/Sony Previews ---
+// --- ENGINE 2: Deep Extractor (Finds Hidden Nikon Previews) ---
 const extractMetadata = async (file: File): Promise<{ url: string | null; meta: PhotoMetadata; blob: Blob | null; orientation: number }> => {
   try {
     let meta: PhotoMetadata = { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() };
@@ -74,11 +74,11 @@ const extractMetadata = async (file: File): Promise<{ url: string | null; meta: 
 
     let thumbBuffer: ArrayBuffer | undefined = undefined;
     
-    // Waterfall Strategy
+    // Waterfall: Preview -> Thumbnail -> Manual Scan
     try { thumbBuffer = await exifr.preview(file); } catch (e) {}
     if (!thumbBuffer) try { thumbBuffer = await exifr.thumbnail(file); } catch (e) {}
     
-    // Nikon D850 Manual Rescue
+    // Manual Nikon D850 Rescue Scan
     if (!thumbBuffer) {
       try {
         const buffer = await file.slice(0, 30 * 1024 * 1024).arrayBuffer();
@@ -95,6 +95,7 @@ const extractMetadata = async (file: File): Promise<{ url: string | null; meta: 
 
     if (thumbBuffer) {
       const blob = new Blob([thumbBuffer], { type: 'image/jpeg' });
+      // Note: This URL is temporary (unrotated). The Sanitizer creates the clean one later.
       return { url: URL.createObjectURL(blob), meta, blob, orientation };
     }
     return { url: null, meta, blob: null, orientation: 1 };
@@ -107,8 +108,6 @@ const generateXMP = (photo: PhotoMission): string => {
   const { rating = 0 } = photo.analysis || {};
   return `<?xpacket begin="?" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description xmp:Rating="${rating}"/></rdf:RDF></x:xmpmeta><?xpacket end="w"?>`;
 };
-
-// --- COMPONENTS (Your Original Design) ---
 
 const StarRating: React.FC<{ rating: number; onRate: (r: number) => void; interactive?: boolean; }> = ({ rating, onRate, interactive = false }) => (
   <div className="flex gap-1 items-center">
@@ -138,13 +137,19 @@ const PhotoCard: React.FC<{ photo: PhotoMission; onToggle: (id: string) => void;
     <div onClick={() => onClick ? onClick() : onToggle(photo.id)} className={`group relative aspect-[3/4] bg-[#0a0a0a] overflow-hidden cursor-pointer transition-all duration-500 border ${isSelected ? 'border-[#d4c5a9]' : 'border-white/5 hover:border-white/20'}`}>
       {photo.previewUrl ? (
         <>
-          <img src={photo.previewUrl} alt={photo.name} className={`w-full h-full object-cover transition-all duration-700 ${isSelected ? 'brightness-110' : 'brightness-50 group-hover:brightness-90'}`} />
-          {photo.status === 'PROCESSING' && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/60"><Loader2 className="text-[#d4c5a9] animate-spin" /></div>
+          <img src={photo.previewUrl} alt={photo.name} className={`w-full h-full object-cover transition-all duration-700 ${isSelected ? 'brightness-110' : 'brightness-50 group-hover:brightness-90'} ${photo.status === 'FAILED' ? 'opacity-30' : 'opacity-100'}`} />
+          {(photo.status === 'PROCESSING' || photo.status === 'PENDING') && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-[2px] z-30 animate-pulse">
+              <Loader2 className="text-[#d4c5a9] animate-spin mb-3" size={24} />
+              <span className="text-[9px] font-mono-data text-[#d4c5a9] tracking-widest uppercase font-black">AI ANALYZING...</span>
+            </div>
           )}
         </>
       ) : (
-        <div className="w-full h-full flex items-center justify-center text-white/20"><FileCode /></div>
+        <div className="w-full h-full flex items-center justify-center text-white/20 flex-col gap-2">
+          <FileCode />
+          <span className="text-[8px] font-mono-data uppercase">NO PREVIEW</span>
+        </div>
       )}
       
       {isSelected && <div className="absolute top-3 right-3 z-20"><div className="w-2.5 h-2.5 rounded-full bg-[#d4c5a9] shadow-[0_0_15px_rgba(212,197,169,0.5)]" /></div>}
@@ -152,12 +157,15 @@ const PhotoCard: React.FC<{ photo: PhotoMission; onToggle: (id: string) => void;
       <div className="absolute inset-0 bg-gradient-to-t from-black via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-5 z-20">
         <p className="text-[10px] font-mono-data text-white font-black tracking-widest uppercase truncate">{photo.name}</p>
         <p className="text-[8px] font-mono-data text-white/40 tracking-widest uppercase font-bold">{photo.metadata?.shutter} • {photo.metadata?.aperture} • ISO {photo.metadata?.iso}</p>
-        {photo.status === 'COMPLETED' && (
+        
+        {photo.status === 'COMPLETED' ? (
           <div className="pt-2 border-t border-white/10 space-y-2">
             <StarRating rating={photo.analysis?.rating || 0} onRate={(r) => onRate(photo.id, r)} interactive />
             <p className="text-[7px] text-white/30 font-black uppercase tracking-widest line-clamp-2">{photo.analysis?.caption}</p>
           </div>
-        )}
+        ) : photo.status === 'FAILED' ? (
+          <p className="text-[8px] text-red-500 font-mono-data uppercase font-black pt-2">ANALYSIS FAILED</p>
+        ) : null}
       </div>
     </div>
   );
@@ -165,55 +173,26 @@ const PhotoCard: React.FC<{ photo: PhotoMission; onToggle: (id: string) => void;
 
 export default function App() {
   const [activeProject, setActiveProject] = useState<Project | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [isProcessingView, setIsProcessingView] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [queue, setQueue] = useState<PhotoMission[]>([]);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [processedCount, setProcessedCount] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { const saved = localStorage.getItem(STORAGE_KEY); if (saved) setActiveProject(JSON.parse(saved)[0] || null); }, []);
   useEffect(() => { if (activeProject) localStorage.setItem(STORAGE_KEY, JSON.stringify([activeProject])); }, [activeProject]);
 
-  // --- THE WORKHORSE QUEUE ---
-  useEffect(() => {
-    const processNext = async () => {
-      if (isProcessing || queue.length === 0 || !activeProject) return;
-      setIsProcessing(true);
-      const p = queue[0];
-      
-      try {
-        setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(x => x.id === p.id ? { ...x, status: 'PROCESSING' } : x) } : null);
-        
-        if (!p._tempBlob) throw new Error("No Blob");
-        const cleanBase64 = await sanitizeAndCompress(p._tempBlob, p._orientation);
-        const analysis = await analyzePhoto(cleanBase64);
-        
-        const cleanUrl = `data:image/jpeg;base64,${cleanBase64}`;
-        
-        setActiveProject(prev => prev ? {
-          ...prev,
-          photos: prev.photos.map(x => x.id === p.id ? { 
-            ...x, status: 'COMPLETED', analysis, previewUrl: cleanUrl, selected: (analysis.rating || 0) >= 3 
-          } : x)
-        } : null);
-      } catch (err) {
-        setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(x => x.id === p.id ? { ...x, status: 'FAILED' } : x) } : null);
-      } finally {
-        setQueue(prev => prev.slice(1));
-        setIsProcessing(false);
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    };
-    processNext();
-  }, [queue, isProcessing, activeProject]);
-
   const processFiles = async (files: FileList) => {
     const fileArray = Array.from(files);
     if (fileArray.length === 0) return;
+
+    setIsProcessingView(true);
+    setProcessedCount(0);
     
     let currentProject = activeProject || { id: Date.now().toString(), name: `PRODUCTION ${new Date().toLocaleDateString()}`, createdAt: Date.now(), lastModified: Date.now(), photos: [] };
     const newPhotos: PhotoMission[] = [];
     
+    // 1. Initial Ingest (Get Metadata + Blob)
     for (const file of fileArray) {
       const { url, meta, blob, orientation } = await extractMetadata(file);
       newPhotos.push({ 
@@ -222,9 +201,58 @@ export default function App() {
         _tempBlob: blob, _orientation: orientation
       });
     }
-    
+
     setActiveProject({ ...currentProject, photos: [...currentProject.photos, ...newPhotos] });
-    setQueue(prev => [...prev, ...newPhotos]);
+
+    // 2. AI Processing Loop
+    for (let i = 0; i < newPhotos.length; i++) {
+      const p = newPhotos[i];
+      // Slight delay to prevent rate limiting
+      if (i > 0) await new Promise(r => setTimeout(r, 500));
+
+      try {
+        if (!p._tempBlob) throw new Error("No preview extracted");
+
+        // Set UI to Processing
+        setActiveProject(prev => prev ? {
+            ...prev, photos: prev.photos.map(x => x.id === p.id ? { ...x, status: 'PROCESSING' } : x)
+        } : null);
+
+        // Sanitize (Rotate & Compress)
+        const cleanBase64 = await sanitizeAndCompress(p._tempBlob, p._orientation || 1);
+        
+        // Analyze
+        const analysis = await analyzePhoto(cleanBase64);
+        
+        // Update with Rotated Preview & Analysis
+        const rotatedUrl = `data:image/jpeg;base64,${cleanBase64}`;
+        
+        setActiveProject(prev => prev ? {
+          ...prev,
+          photos: prev.photos.map(item => item.id === p.id ? { 
+            ...item, status: 'COMPLETED', analysis, 
+            previewUrl: rotatedUrl, 
+            selected: (analysis.rating || 0) >= 3 
+          } : item)
+        } : null);
+
+      } catch (err) {
+        console.error("Failure:", err);
+        setActiveProject(prev => prev ? {
+          ...prev,
+          photos: prev.photos.map(item => item.id === p.id ? { ...item, status: 'FAILED' } : item)
+        } : null);
+      }
+      setProcessedCount(i + 1);
+    }
+    setTimeout(() => setIsProcessingView(false), 1000);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); };
+  const handleDragLeave = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsDragging(false); };
+  const handleDrop = (e: React.DragEvent) => { 
+    e.preventDefault(); e.stopPropagation(); setIsDragging(false); 
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) processFiles(e.dataTransfer.files); 
   };
 
   const handleExportXMP = async () => {
@@ -240,16 +268,8 @@ export default function App() {
     setIsExporting(false);
   };
 
-  // Fixed Drag Handlers
-  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); };
-  const handleDragLeave = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsDragging(false); };
-  const handleDrop = (e: React.DragEvent) => { 
-    e.preventDefault(); e.stopPropagation(); setIsDragging(false); 
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) processFiles(e.dataTransfer.files); 
-  };
-
   return (
-    <div className="min-h-screen bg-[#050505] text-white font-mono-data" onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
+    <div className="min-h-screen bg-[#050505] text-white selection:bg-[#d4c5a9] selection:text-black font-mono-data" onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
       <Header count={activeProject?.photos.filter(p => p.selected).length || 0} total={activeProject?.photos.length || 0} projectName={activeProject?.name} onBack={() => setActiveProject(null)} />
       
       <main className="pt-16 pb-32 min-h-screen flex flex-col relative">
@@ -259,7 +279,15 @@ export default function App() {
           </div>
         )}
 
-        {!activeProject || activeProject.photos.length === 0 ? (
+        {isProcessingView ? (
+          <div className="flex-grow flex flex-col items-center justify-center animate-in fade-in duration-500">
+            <div className="text-center space-y-8">
+              <p className="text-[10px] tracking-[0.3em] text-[#d4c5a9] uppercase font-black">AI TONAL SCANNING...</p>
+              <div className="w-64 h-[1px] bg-white/5 mx-auto relative overflow-hidden"><div className="absolute inset-y-0 left-0 bg-[#d4951f] transition-all duration-300" style={{ width: `${(processedCount / (activeProject?.photos.length || 1)) * 100}%` }} /></div>
+              <p className="text-[9px] tracking-widest text-white/30 uppercase font-black">{Math.round((processedCount / (activeProject?.photos.length || 1)) * 100)}%</p>
+            </div>
+          </div>
+        ) : !activeProject || activeProject.photos.length === 0 ? (
           <div className="flex-grow flex flex-col items-center justify-center cursor-pointer px-12 group" onClick={() => fileInputRef.current?.click()}>
             <div className={`w-full max-w-3xl aspect-[16/6] border flex flex-col items-center justify-center gap-6 relative transition-all duration-500 border-white/5 group-hover:border-white/20`}>
               <div className="text-center space-y-3 pointer-events-none"><p className="text-xl tracking-[0.2em] text-white font-black uppercase">DROP PRODUCTION ASSETS</p><p className="text-[9px] text-white/20 uppercase tracking-widest">RAW • JPG • NEF • CR3</p></div>
@@ -268,13 +296,7 @@ export default function App() {
           </div>
         ) : (
           <div className="px-8 animate-in fade-in duration-500">
-            {queue.length > 0 && (
-               <div className="fixed top-20 left-1/2 -translate-x-1/2 bg-black/80 px-4 py-2 rounded-full border border-white/10 z-50 flex items-center gap-3 shadow-xl">
-                 <Loader2 className="animate-spin text-[#d4c5a9]" size={14} />
-                 <span className="text-[10px] text-white font-bold tracking-widest">PROCESSING QUEUE: {queue.length} REMAINING</span>
-               </div>
-             )}
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 2xl:grid-cols-8 gap-4 mt-8">
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 2xl:grid-cols-8 gap-4">
               {activeProject.photos.map((item: any) => (
                 <PhotoCard key={item.id} photo={item} onToggle={(id) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id ? { ...p, selected: !p.selected } : p) } : null)} onRate={(id, rating) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id && p.analysis ? { ...p, selected: rating >= 3, analysis: { ...p.analysis, rating } } : p) } : null)} />
               ))}
@@ -283,7 +305,7 @@ export default function App() {
         )}
       </main>
 
-      {activeProject && activeProject.photos.some(p => p.status === 'COMPLETED') && (
+      {activeProject && activeProject.photos.some(p => p.status === 'COMPLETED') && !isProcessingView && (
         <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-40 w-full max-w-2xl px-6">
           <div className="bg-[#0a0a0a] border border-white/10 px-8 py-4 flex items-center justify-between rounded-full shadow-2xl">
             <div className="flex items-center gap-8"><button className="text-[10px] tracking-widest text-white/40 hover:text-white transition-all flex items-center gap-2 font-black uppercase"><Save size={12} /> BACKUP</button><div className="h-4 w-px bg-white/10"></div><div className="text-[10px] tracking-widest text-[#d4c5a9] font-black uppercase">{activeProject.photos.filter(p => p.selected).length} KEEPS</div></div>
