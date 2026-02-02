@@ -8,7 +8,7 @@ import JSZip from 'jszip';
 import { PhotoMission, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
-const STORAGE_KEY = 'novus_cura_studio_v17_manual_slice';
+const STORAGE_KEY = 'novus_cura_studio_v18_brute_force';
 
 // --- Utility: Blob to Base64 (For AI Analysis) ---
 const blobToBase64 = (blob: Blob): Promise<string> => {
@@ -62,76 +62,47 @@ const generateXMP = (photo: PhotoMission): string => {
 <?xpacket end="w"?>`;
 };
 
-// --- Engine: The "Manual Surgeon" Extraction ---
-// Uses byte-level slicing to extract embedded JPEGs from Nikon/Sony/Canon RAWs
+// --- Engine: Extract Metadata & Preview BLOB (BRUTE FORCE MODE) ---
 const extractData = async (file: File): Promise<{ thumbnailBlob: Blob | null; meta: PhotoMetadata }> => {
   try {
-    // 1. Parse Metadata + offsets (Do not merge output, keep IFDs separate)
-    // We explicitly ask for "tiff" structural data to find the JpgFromRaw offsets
-    const output = await exifr.parse(file, {
+    // 1. Convert File to ArrayBuffer immediately to avoid stream errors
+    const arrayBuffer = await file.arrayBuffer();
+
+    // 2. Parse Metadata using the Buffer (More reliable for large files)
+    const exif = await exifr.parse(arrayBuffer, {
       tiff: true,
       ifd0: true,
       ifd1: true,
       exif: true,
-      xmp: false,
-      mergeOutput: false // CRITICAL: Keeps IFD structure so we can find hidden offsets
+      xmp: false
     });
 
-    // Flatten metadata for UI
-    const combined = { ...output.ifd0, ...output.exif, ...output.ifd1 };
     const meta: PhotoMetadata = {
-      iso: combined?.ISO?.toString() || '100',
-      aperture: combined?.FNumber ? `f/${combined.FNumber}` : 'f/2.8',
-      shutter: combined?.ExposureTime ? `1/${Math.round(1/combined.ExposureTime)}` : '1/250',
-      timestamp: combined?.DateTimeOriginal ? new Date(combined.DateTimeOriginal).getTime() : Date.now()
+      iso: exif?.ISO?.toString() || '100',
+      aperture: exif?.FNumber ? `f/${exif.FNumber}` : 'f/2.8',
+      shutter: exif?.ExposureTime ? `1/${Math.round(1/exif.ExposureTime)}` : '1/250',
+      timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
     };
 
-    // 2. The Manual Slice Strategy (Finding the hidden JPEG bytes)
-    let start: number | undefined;
-    let length: number | undefined;
-
-    // Strategy A: Nikon D850 / D5 / Z Series (JpgFromRaw in IFD0 or SubIFD)
-    if (output.ifd0?.JpgFromRawStart && output.ifd0?.JpgFromRawLength) {
-        start = output.ifd0.JpgFromRawStart;
-        length = output.ifd0.JpgFromRawLength;
-    } 
-    // Strategy B: Sony ARW (PreviewImageStart)
-    else if (output.ifd0?.PreviewImageStart && output.ifd0?.PreviewImageLength) {
-        start = output.ifd0.PreviewImageStart;
-        length = output.ifd0.PreviewImageLength;
-    }
-    // Strategy C: Standard TIFF/Canon (ThumbnailOffset in IFD1)
-    else if (output.ifd1?.ThumbnailOffset && output.ifd1?.ThumbnailLength) {
-        start = output.ifd1.ThumbnailOffset;
-        length = output.ifd1.ThumbnailLength;
-    }
-    // Strategy D: Fallback for older Nikon (StripOffsets in IFD1)
-    else if (output.ifd1?.StripOffsets && output.ifd1?.StripByteCounts) {
-        start = Array.isArray(output.ifd1.StripOffsets) ? output.ifd1.StripOffsets[0] : output.ifd1.StripOffsets;
-        length = Array.isArray(output.ifd1.StripByteCounts) ? output.ifd1.StripByteCounts[0] : output.ifd1.StripByteCounts;
-    }
-
+    // 3. The Brute Force Extraction Chain
     let thumbnailBlob: Blob | null = null;
+    let thumbBuffer: ArrayBuffer | undefined = undefined;
 
-    if (start && length) {
-        // DIRECT SURGERY: Slice the bytes directly from the file
-        // This is 100% accurate because it uses the camera's own map
-        try {
-            const blobPart = file.slice(start, start + length);
-            thumbnailBlob = new Blob([blobPart], { type: 'image/jpeg' });
-        } catch (e) {
-            console.warn("Slice failed", e);
-        }
+    try {
+      // PRIORITY 1: Large Preview (Found in Nikon SubIFDs)
+      // We explicitly pass the arrayBuffer to ensure it scans the whole memory
+      thumbBuffer = await exifr.preview(arrayBuffer);
+    } catch (e) { console.warn("Preview attempt 1 failed"); }
+
+    if (!thumbBuffer) {
+      try {
+        // PRIORITY 2: Standard Thumbnail
+        thumbBuffer = await exifr.thumbnail(arrayBuffer);
+      } catch (e) { console.warn("Preview attempt 2 failed"); }
     }
 
-    // 3. Last Resort: Library Helper (If manual slice failed)
-    if (!thumbnailBlob) {
-        try {
-            const buffer = await exifr.thumbnail(file);
-            if (buffer) thumbnailBlob = new Blob([buffer], { type: 'image/jpeg' });
-        } catch (e) {
-            // Silently fail
-        }
+    if (thumbBuffer) {
+      thumbnailBlob = new Blob([thumbBuffer], { type: 'image/jpeg' });
     }
 
     return { thumbnailBlob, meta };
@@ -295,7 +266,7 @@ const PhotoRow: React.FC<{
              </div>
            ) : photo.status === 'FAILED' ? (
              <span className="text-[9px] text-red-500/50 font-mono-data uppercase tracking-widest">
-               RAW PREVIEW EXTRACTION FAILED - FILE UNREADABLE
+               NO EMBEDDED PREVIEW (TRY SHOOTING RAW+JPG)
              </span>
            ) : (
              <span className="text-[9px] text-white/10 font-mono-data uppercase tracking-widest">WAITING FOR INTELLIGENCE...</span>
@@ -353,8 +324,6 @@ export default function App() {
 
     const newPhotos: PhotoMission[] = [];
     for (const file of fileArray) {
-      // NOTE: We do NOT extract the Blob here to save memory in the main state
-      // We only extract Metadata for the UI list
       const { meta } = await extractData(file); 
       newPhotos.push({
         id: Math.random().toString(36).substr(2, 9),
@@ -379,18 +348,13 @@ export default function App() {
       } : null);
 
       try {
-        // A. Extract ACTUAL Thumbnail Blob for AI using Manual Surgery
         const { thumbnailBlob } = await extractData(p.file!);
         
         if (!thumbnailBlob) throw new Error("No preview found in RAW");
 
-        // B. Convert Thumbnail to Base64 (Small payload)
         const base64 = await blobToBase64(thumbnailBlob);
-
-        // C. Send to Gemini
         const analysis = await analyzePhoto(base64);
 
-        // D. Success
         setActiveProject(prev => prev ? {
           ...prev,
           photos: prev.photos.map(item => item.id === p.id ? { 
@@ -484,53 +448,4 @@ export default function App() {
                 <p className="text-[9px] text-white/20 uppercase tracking-widest">RAW • JPG • NEF • CR3</p>
               </div>
             </div>
-            <input type="file" ref={fileInputRef} multiple className="hidden" onChange={(e) => e.target.files && processFiles(e.target.files)} />
-          </div>
-        ) : (
-          <div className="animate-in fade-in duration-500 w-full">
-            <div className="flex items-center justify-between p-4 border-b border-white/10 text-[9px] font-mono-data text-white/30 uppercase tracking-[0.2em]">
-              <div className="flex items-center gap-6 flex-1">
-                <span className="w-8 text-center">STS</span>
-                <span className="w-48">FILENAME / META</span>
-                <span className="flex-1 px-4">INTELLIGENCE</span>
-              </div>
-              <span className="w-48 text-right">RATING</span>
-            </div>
-
-            <div className="flex flex-col">
-              {visiblePhotos.map((photo) => (
-                <PhotoRow 
-                  key={photo.id} photo={photo} 
-                  onToggle={(id) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id ? { ...p, selected: !p.selected } : p) } : null)} 
-                  onRate={(id, rating) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id && p.analysis ? { ...p, selected: rating >= 3, analysis: { ...p.analysis, rating } } : p) } : null)} 
-                />
-              ))}
-            </div>
-          </div>
-        )}
-      </main>
-
-      {activeProject && activeProject.photos.length > 0 && !isProcessing && (
-        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-40 w-full max-w-2xl px-6">
-          <div className="bg-[#0a0a0a] border border-white/10 px-8 py-4 flex items-center justify-between rounded-full shadow-2xl">
-            <div className="flex items-center gap-8">
-              <button className="text-[10px] tracking-widest text-white/40 hover:text-white transition-all flex items-center gap-2 font-black uppercase">
-                <Save size={12} /> BACKUP
-              </button>
-              <div className="h-4 w-px bg-white/10"></div>
-              <div className="text-[10px] tracking-widest text-[#d4c5a9] font-black uppercase">{activeProject.photos.filter(p => p.selected).length} KEEPS</div>
-            </div>
-            <button 
-              onClick={handleExportXMP}
-              disabled={isExporting}
-              className="bg-white hover:bg-[#d4c5a9] text-black text-[10px] font-black tracking-widest uppercase px-8 py-2.5 rounded-full transition-all flex items-center gap-3 disabled:opacity-50"
-            >
-              {isExporting ? <Loader2 className="animate-spin" size={12} /> : 'EXPORT XMP'}
-              <ArrowRight size={14} />
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
+            <input type="file" ref={fileInputRef}
