@@ -1,4 +1,3 @@
-
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
   ArrowRight, 
@@ -81,9 +80,16 @@ const generateXMP = (photo: PhotoMission): string => {
 // --- Engine: Extract RAW Preview & Metadata ---
 const extractMetadata = async (file: File): Promise<{ url: string | null; meta: PhotoMetadata }> => {
   try {
-    const exif = await exifr.parse(file);
-    const url = await exifr.thumbnailUrl(file);
-    
+    // 1. Parse Metadata First
+    const exif = await exifr.parse(file, {
+      tiff: true,
+      ifd0: true,
+      ifd1: true,
+      exif: true,
+      gps: false,
+      interop: false,
+    });
+
     const meta: PhotoMetadata = {
       iso: exif?.ISO?.toString() || '100',
       aperture: exif?.FNumber ? `f/${exif.FNumber}` : 'f/2.8',
@@ -91,14 +97,25 @@ const extractMetadata = async (file: File): Promise<{ url: string | null; meta: 
       timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
     };
 
-    let previewUrl = url;
-    if (!previewUrl && (file.type.startsWith('image/') || /\.(jpg|jpeg|png|webp)$/i.test(file.name))) {
+    // 2. Attempt Preview Extraction
+    let previewUrl: string | null = null;
+    
+    try {
+      // Force prioritize the largest JPEG preview available
+      // .nef and .cr3 often keep the good preview in 'preview' or 'JpgFromRaw'
+      previewUrl = await exifr.thumbnailUrl(file);
+    } catch (e) {
+      console.warn('Exifr thumbnail extraction failed, falling back...');
+    }
+
+    // 3. Fallback for Standard Images (JPG/PNG)
+    if (!previewUrl && (file.type === 'image/jpeg' || file.type === 'image/png' || file.type === 'image/webp')) {
       previewUrl = URL.createObjectURL(file);
     }
     
     return { url: previewUrl || null, meta };
   } catch (err) {
-    console.warn(`Extraction failed for ${file.name}:`, err);
+    console.warn(`Extraction failed completely for ${file.name}:`, err);
     return { 
       url: null, 
       meta: { iso: '100', aperture: 'f/2.8', shutter: '1/250', timestamp: Date.now() } 
@@ -244,6 +261,7 @@ const PhotoCard: React.FC<{
 }> = ({ photo, onToggle, onRate, stackCount, onClick }) => {
   const isCompleted = photo.status === 'COMPLETED';
   const isSelected = photo.selected;
+  const [imgError, setImgError] = useState(false);
 
   return (
     <div 
@@ -252,10 +270,11 @@ const PhotoCard: React.FC<{
         ${isSelected ? 'border-[#d4c5a9]' : 'border-white/5 hover:border-white/20'}
       `}
     >
-      {photo.previewUrl ? (
+      {photo.previewUrl && !imgError ? (
         <img 
           src={photo.previewUrl} 
           alt={photo.name} 
+          onError={() => setImgError(true)}
           className={`w-full h-full object-cover transition-all duration-700 
             ${isSelected ? 'brightness-110' : 'brightness-50 group-hover:brightness-90'}
           `}
@@ -263,7 +282,12 @@ const PhotoCard: React.FC<{
       ) : (
         <div className="w-full h-full bg-[#1a1a1a] flex flex-col items-center justify-center gap-3">
           <FileCode size={24} className="text-white/20" />
-          <p className="text-[8px] font-mono-data text-white/30 uppercase font-black">NO PREVIEW</p>
+          <p className="text-[8px] font-mono-data text-white/30 uppercase font-black">
+            {photo.name.length > 20 ? photo.name.substring(0, 15) + '...' : photo.name}
+          </p>
+          <p className="text-[7px] font-mono-data text-[#d4c5a9]/50 uppercase tracking-widest">
+            {imgError ? 'PREVIEW ERROR' : 'NO PREVIEW'}
+          </p>
         </div>
       )}
 
