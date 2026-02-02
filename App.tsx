@@ -1,26 +1,65 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
   ArrowRight, Loader2, Star, Save, FileCode, ArrowLeft, Edit2, Search, 
-  History, CheckCircle2, AlertCircle, FileImage
+  History, CheckCircle2, AlertCircle, FileImage, RefreshCw
 } from 'lucide-react';
 import exifr from 'exifr';
 import JSZip from 'jszip';
 import { PhotoMission, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
-const STORAGE_KEY = 'novus_cura_studio_v20_final';
+const STORAGE_KEY = 'novus_cura_studio_v21_sanitizer';
 
-// --- Utility: Blob to Base64 (For AI Analysis) ---
-const blobToBase64 = (blob: Blob): Promise<string> => {
+// --- Utility: Image Sanitizer & Compressor ---
+// Takes a raw Blob (even a messy one), renders it to Canvas, and returns a clean, small Base64 string.
+const sanitizeAndCompress = (blob: Blob): Promise<string> => {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.readAsDataURL(blob);
-    reader.onload = () => {
-      const result = reader.result as string;
-      const base64 = result.split(',')[1];
-      resolve(base64);
+    const img = new Image();
+    const url = URL.createObjectURL(blob);
+    
+    img.onload = () => {
+      // Create a virtual canvas
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      
+      // Resize logic: Max 1024px width/height (AI doesn't need 45MP)
+      const MAX_SIZE = 1024;
+      let width = img.width;
+      let height = img.height;
+
+      if (width > height) {
+        if (width > MAX_SIZE) {
+          height *= MAX_SIZE / width;
+          width = MAX_SIZE;
+        }
+      } else {
+        if (height > MAX_SIZE) {
+          width *= MAX_SIZE / height;
+          height = MAX_SIZE;
+        }
+      }
+
+      canvas.width = width;
+      canvas.height = height;
+
+      // Draw the image (this forces the browser to decode and clean the JPEG)
+      if (ctx) {
+        ctx.drawImage(img, 0, 0, width, height);
+        // Export as clean JPEG (0.8 quality is perfect for AI)
+        const base64 = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+        resolve(base64);
+      } else {
+        reject(new Error("Canvas context failed"));
+      }
+      URL.revokeObjectURL(url);
     };
-    reader.onerror = (error) => reject(error);
+
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Image render failed - Data corrupt"));
+    };
+
+    img.src = url;
   });
 };
 
@@ -65,164 +104,103 @@ const generateXMP = (photo: PhotoMission): string => {
 // --- Engine: The "Deep Search" Extraction (D850 Fix) ---
 const extractData = async (file: File): Promise<{ thumbnailBlob: Blob | null; meta: PhotoMetadata }> => {
   try {
-    // 1. Parse Metadata (Enable MakerNotes for Nikon)
+    // 1. Parse Metadata
     let meta: PhotoMetadata = { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() };
-    
     try {
-      // Read only the header/metadata chunks first to save memory
       const exif = await exifr.parse(file, {
-        tiff: true,
-        ifd0: true,
-        exif: true,
-        makerNote: true, // CRITICAL for Nikon D850
-        xmp: false
+        tiff: true, ifd0: true, exif: true, makerNote: true, xmp: false
       });
-
       meta = {
         iso: exif?.ISO?.toString() || '100',
         aperture: exif?.FNumber ? `f/${exif.FNumber}` : 'f/2.8',
         shutter: exif?.ExposureTime ? `1/${Math.round(1/exif.ExposureTime)}` : '1/250',
         timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
       };
-    } catch (e) { console.warn("Metadata scan warning"); }
+    } catch (e) { /* ignore meta errors */ }
 
     // 2. Extraction Strategy
-    let thumbnailBlob: Blob | null = null;
     let thumbBuffer: ArrayBuffer | undefined = undefined;
 
-    // Strategy A: Standard Preview (Works for Sony/Canon)
-    try {
-      thumbBuffer = await exifr.preview(file);
-    } catch (e) { /* continue */ }
+    // Strategy A: Standard Preview
+    try { thumbBuffer = await exifr.preview(file); } catch (e) {}
 
-    // Strategy B: Thumbnail (Works for some smaller RAWs)
+    // Strategy B: Thumbnail
     if (!thumbBuffer) {
-      try {
-        thumbBuffer = await exifr.thumbnail(file);
-      } catch (e) { /* continue */ }
+      try { thumbBuffer = await exifr.thumbnail(file); } catch (e) {}
     }
 
-    // Strategy C: The "Manual Binary Scan" (Nikon D850 Fix)
-    // If library methods failed, we scan the file manually for the JPEG Header (FF D8)
+    // Strategy C: Manual Binary Scan (The Nikon D850 Fix)
     if (!thumbBuffer) {
       try {
-        // Read the first 20MB. D850 previews are usually at the start.
-        // If we read the whole file it might crash the browser on drop.
-        const CHUNK_SIZE = 20 * 1024 * 1024; 
+        const CHUNK_SIZE = 20 * 1024 * 1024; // Scan first 20MB
         const buffer = await file.slice(0, CHUNK_SIZE).arrayBuffer();
         const view = new DataView(buffer);
         
-        // Look for JPEG Start (FF D8)
         let start = -1;
-        // Skip the first few bytes to avoid false positives in the TIFF header
-        for (let i = 1000; i < buffer.byteLength - 1; i++) {
+        // Search for FF D8 (Start of Image)
+        for (let i = 0; i < buffer.byteLength - 1; i++) {
           if (view.getUint8(i) === 0xFF && view.getUint8(i+1) === 0xD8) {
-            // Found a JPEG start signature
-            // Check if it looks like a real image (followed by FF E1 or FF DB)
-            const nextMark = view.getUint8(i+2);
-            if (nextMark === 0xFF) {
+             // Check if it's a "real" JPEG header (usually followed by FF E0, FF E1, FF DB)
+             const next = view.getUint8(i+2);
+             if (next === 0xFF) {
                start = i;
-               break; // Take the first valid JPEG found (usually the preview)
-            }
+               break; // Found the start
+             }
           }
         }
 
         if (start !== -1) {
-          // Found it! Now we need to guess the end or just grab a chunk.
-          // Since we can't easily find the End Of Image (FF D9) without scanning everything,
-          // we will grab a generous 10MB chunk from this start point. 
-          // Browsers are good at rendering truncated JPEGs if the header is valid.
-          const end = Math.min(buffer.byteLength, start + 10 * 1024 * 1024);
+          // Grab a large chunk from start. The Sanitizer will fix the end.
+          const end = Math.min(buffer.byteLength, start + 8 * 1024 * 1024);
           thumbBuffer = buffer.slice(start, end);
         }
       } catch (e) { console.warn("Manual scan failed"); }
     }
 
-    if (thumbBuffer) {
-      thumbnailBlob = new Blob([thumbBuffer], { type: 'image/jpeg' });
-    }
-
+    const thumbnailBlob = thumbBuffer ? new Blob([thumbBuffer], { type: 'image/jpeg' }) : null;
     return { thumbnailBlob, meta };
   } catch (err) {
-    console.error(`Extraction Critical Fail (${file.name}):`, err);
-    return { 
-      thumbnailBlob: null, 
-      meta: { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() } 
-    };
+    return { thumbnailBlob: null, meta: { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() } };
   }
 };
 
-const StarRating: React.FC<{ 
-  rating: number; 
-  onRate: (r: number) => void;
-  interactive?: boolean;
-}> = ({ rating, onRate, interactive = false }) => {
+const StarRating: React.FC<{ rating: number; onRate: (r: number) => void; interactive?: boolean; }> = ({ rating, onRate, interactive = false }) => {
   return (
     <div className="flex gap-1 items-center">
       {[1, 2, 3, 4, 5].map((star) => (
         <button
-          key={star}
-          disabled={!interactive}
+          key={star} disabled={!interactive}
           onClick={(e) => { e.stopPropagation(); onRate(star); }}
           className={`transition-all ${interactive ? 'hover:scale-110' : 'cursor-default'}`}
         >
-          <Star 
-            size={14} 
-            className={`${star <= rating ? 'fill-[#d4c5a9] text-[#d4c5a9]' : 'text-white/10'}`} 
-            strokeWidth={star <= rating ? 0 : 2}
-          />
+          <Star size={14} className={`${star <= rating ? 'fill-[#d4c5a9] text-[#d4c5a9]' : 'text-white/10'}`} strokeWidth={star <= rating ? 0 : 2} />
         </button>
       ))}
       {interactive && (
-        <button
-          onClick={(e) => { e.stopPropagation(); onRate(0); }}
-          className="ml-3 text-[9px] font-mono-data text-white/20 uppercase tracking-widest font-black hover:text-white transition-colors"
-        >
-          CLEAR
-        </button>
+        <button onClick={(e) => { e.stopPropagation(); onRate(0); }} className="ml-3 text-[9px] font-mono-data text-white/20 uppercase tracking-widest font-black hover:text-white transition-colors">CLEAR</button>
       )}
     </div>
   );
 };
 
-const Header: React.FC<{ 
-  count: number; total: number; projectName?: string; 
-  onRename?: (name: string) => void; onBack?: () => void; 
-  onShowHistory?: () => void; searchQuery: string; onSearch: (q: string) => void;
-}> = ({ count, total, projectName, onRename, onBack, onShowHistory, searchQuery, onSearch }) => {
+const Header: React.FC<{ count: number; total: number; projectName?: string; onRename?: (name: string) => void; onBack?: () => void; onShowHistory?: () => void; searchQuery: string; onSearch: (q: string) => void; }> = ({ count, total, projectName, onRename, onBack, onShowHistory, searchQuery, onSearch }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [tempName, setTempName] = useState(projectName || '');
-
   useEffect(() => { if (projectName) setTempName(projectName); }, [projectName]);
-
-  const handleSubmit = () => {
-    if (tempName.trim() && onRename) onRename(tempName.trim());
-    setIsEditing(false);
-  };
+  const handleSubmit = () => { if (tempName.trim() && onRename) onRename(tempName.trim()); setIsEditing(false); };
 
   return (
     <header className="fixed top-0 left-0 right-0 h-16 px-8 flex justify-between items-center z-50 bg-[#050505] border-b border-white/5">
       <div className="flex items-center gap-6">
-        {onBack && (
-          <button onClick={onBack} className="text-white/40 hover:text-white transition-all">
-            <ArrowLeft size={16} />
-          </button>
-        )}
+        {onBack && <button onClick={onBack} className="text-white/40 hover:text-white transition-all"><ArrowLeft size={16} /></button>}
         <div className="flex flex-col">
           <h1 className="text-[11px] font-mono-data font-black tracking-[0.2em] uppercase text-white">NOVUS CURA</h1>
           {projectName && (
             <div className="flex items-center gap-2 group">
               {isEditing ? (
-                <input
-                  autoFocus
-                  className="bg-transparent border-b border-[#d4c5a9] text-[9px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-bold focus:outline-none py-0 px-0"
-                  value={tempName} onChange={(e) => setTempName(e.target.value)}
-                  onBlur={handleSubmit} onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
-                />
+                <input autoFocus className="bg-transparent border-b border-[#d4c5a9] text-[9px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-bold focus:outline-none py-0 px-0" value={tempName} onChange={(e) => setTempName(e.target.value)} onBlur={handleSubmit} onKeyDown={(e) => e.key === 'Enter' && handleSubmit()} />
               ) : (
-                <button onClick={() => setIsEditing(true)} className="text-[9px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-bold hover:text-white transition-all flex items-center gap-2">
-                  {projectName} <Edit2 size={10} className="opacity-0 group-hover:opacity-100 transition-opacity" />
-                </button>
+                <button onClick={() => setIsEditing(true)} className="text-[9px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-bold hover:text-white transition-all flex items-center gap-2">{projectName} <Edit2 size={10} className="opacity-0 group-hover:opacity-100 transition-opacity" /></button>
               )}
             </div>
           )}
@@ -231,91 +209,49 @@ const Header: React.FC<{
       <div className="flex-grow max-w-xl px-12">
         <div className="relative group">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-white/20 group-focus-within:text-[#d4c5a9] transition-colors" size={14} />
-          <input 
-            type="text" placeholder="SEMANTIC SEARCH..."
-            className="w-full bg-white/[0.03] border border-white/5 rounded-full py-2 pl-10 pr-4 text-[9px] font-mono-data tracking-widest uppercase text-white placeholder:text-white/10 focus:outline-none focus:border-white/20 transition-all"
-            value={searchQuery} onChange={(e) => onSearch(e.target.value)}
-          />
+          <input type="text" placeholder="SEMANTIC SEARCH..." className="w-full bg-white/[0.03] border border-white/5 rounded-full py-2 pl-10 pr-4 text-[9px] font-mono-data tracking-widest uppercase text-white placeholder:text-white/10 focus:outline-none focus:border-white/20 transition-all" value={searchQuery} onChange={(e) => onSearch(e.target.value)} />
         </div>
       </div>
       <div className="flex items-center gap-10">
-        {onShowHistory && (
-          <button onClick={onShowHistory} className="flex items-center gap-2 text-[10px] font-mono-data tracking-widest text-white/40 hover:text-white font-bold uppercase transition-all">
-            <History size={12} /> ARCHIVE
-          </button>
-        )}
-        {total > 0 && (
-          <div className="text-[10px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-black">
-            <span className="text-white">{count}</span> / {total} ASSETS
-          </div>
-        )}
+        {total > 0 && <div className="text-[10px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-black"><span className="text-white">{count}</span> / {total} ASSETS</div>}
       </div>
     </header>
   );
 };
 
-// --- LIST VIEW COMPONENT ---
-const PhotoRow: React.FC<{ 
-  photo: PhotoMission; 
-  onToggle: (id: string) => void; 
-  onRate: (id: string, rating: number) => void; 
-}> = ({ photo, onToggle, onRate }) => {
+const PhotoRow: React.FC<{ photo: PhotoMission; onToggle: (id: string) => void; onRate: (id: string, rating: number) => void; }> = ({ photo, onToggle, onRate }) => {
   const isSelected = photo.selected;
-  
   return (
-    <div 
-      onClick={() => onToggle(photo.id)}
-      className={`group flex items-center justify-between p-4 border-b transition-all cursor-pointer
-        ${isSelected ? 'bg-[#d4c5a9]/5 border-[#d4c5a9]/30' : 'bg-transparent border-white/5 hover:bg-white/[0.02]'}
-      `}
-    >
+    <div onClick={() => onToggle(photo.id)} className={`group flex items-center justify-between p-4 border-b transition-all cursor-pointer ${isSelected ? 'bg-[#d4c5a9]/5 border-[#d4c5a9]/30' : 'bg-transparent border-white/5 hover:bg-white/[0.02]'}`}>
       <div className="flex items-center gap-6 flex-1">
-        {/* Status Icon */}
         <div className="w-8 flex justify-center">
           {photo.status === 'PENDING' && <div className="w-2 h-2 bg-white/20 rounded-full" />}
-          {photo.status === 'PROCESSING' && <Loader2 size={16} className="text-[#d4c5a9] animate-spin" />}
+          {photo.status === 'COMPRESSING' && <RefreshCw size={16} className="text-[#d4c5a9] animate-spin" />}
+          {photo.status === 'ANALYZING' && <Loader2 size={16} className="text-[#d4c5a9] animate-spin" />}
           {photo.status === 'COMPLETED' && <CheckCircle2 size={16} className="text-[#d4c5a9]" />}
           {photo.status === 'FAILED' && <AlertCircle size={16} className="text-red-500" />}
         </div>
-
-        {/* File Info */}
         <div className="flex flex-col w-48">
-          <span className={`text-[11px] font-mono-data font-bold tracking-wider ${isSelected ? 'text-white' : 'text-white/60'}`}>
-            {photo.name}
-          </span>
-          <span className="text-[9px] font-mono-data text-white/30 uppercase">
-            {photo.metadata?.iso !== '-' ? `ISO ${photo.metadata?.iso} • ${photo.metadata?.shutter} • ${photo.metadata?.aperture}` : 'RAW DATA'}
-          </span>
+          <span className={`text-[11px] font-mono-data font-bold tracking-wider ${isSelected ? 'text-white' : 'text-white/60'}`}>{photo.name}</span>
+          <span className="text-[9px] font-mono-data text-white/30 uppercase">{photo.metadata?.iso !== '-' ? `ISO ${photo.metadata?.iso} • ${photo.metadata?.shutter} • ${photo.metadata?.aperture}` : 'RAW DATA'}</span>
         </div>
-
-        {/* AI Analysis / Caption */}
         <div className="flex-1 px-4">
            {photo.status === 'COMPLETED' ? (
              <div className="flex flex-col gap-1">
-               <span className="text-[10px] text-white/80 font-mono-data uppercase tracking-wide">
-                 {photo.analysis?.reason || photo.analysis?.caption || 'ANALYZED'}
-               </span>
-               {photo.analysis?.keywords && photo.analysis.keywords.length > 0 && (
-                 <span className="text-[8px] text-white/30 font-mono-data uppercase tracking-widest">
-                   {photo.analysis.keywords.slice(0, 3).join(' / ')}
-                 </span>
-               )}
+               <span className="text-[10px] text-white/80 font-mono-data uppercase tracking-wide">{photo.analysis?.reason || photo.analysis?.caption || 'ANALYZED'}</span>
+               {photo.analysis?.keywords && <span className="text-[8px] text-white/30 font-mono-data uppercase tracking-widest">{photo.analysis.keywords.slice(0, 3).join(' / ')}</span>}
              </div>
            ) : photo.status === 'FAILED' ? (
-             <span className="text-[9px] text-red-500/50 font-mono-data uppercase tracking-widest">
-               NO EMBEDDED PREVIEW FOUND (CHECK CAMERA SETTINGS)
-             </span>
+             <span className="text-[9px] text-red-500/50 font-mono-data uppercase tracking-widest">{photo.analysis?.reason || "PREVIEW EXTRACTION FAILED"}</span>
            ) : (
-             <span className="text-[9px] text-white/10 font-mono-data uppercase tracking-widest">WAITING FOR INTELLIGENCE...</span>
+             <span className="text-[9px] text-white/10 font-mono-data uppercase tracking-widest">
+               {photo.status === 'COMPRESSING' ? 'OPTIMIZING PREVIEW...' : photo.status === 'ANALYZING' ? 'AI GRADING...' : 'WAITING...'}
+             </span>
            )}
         </div>
       </div>
-
-      {/* Ratings */}
       <div className="w-48 flex justify-end">
-        {photo.status === 'COMPLETED' && (
-          <StarRating rating={photo.analysis?.rating || 0} onRate={(r) => onRate(photo.id, r)} interactive />
-        )}
+        {photo.status === 'COMPLETED' && <StarRating rating={photo.analysis?.rating || 0} onRate={(r) => onRate(photo.id, r)} interactive />}
       </div>
     </div>
   );
@@ -361,8 +297,6 @@ export default function App() {
 
     const newPhotos: PhotoMission[] = [];
     for (const file of fileArray) {
-      // NOTE: We do NOT extract the Blob here to save memory in the main state
-      // We only extract Metadata for the UI list
       const { meta } = await extractData(file); 
       newPhotos.push({
         id: Math.random().toString(36).substr(2, 9),
@@ -381,19 +315,33 @@ export default function App() {
     for (let i = 0; i < newPhotos.length; i++) {
       const p = newPhotos[i];
       
-      setActiveProject(prev => prev ? {
-        ...prev,
-        photos: prev.photos.map(item => item.id === p.id ? { ...item, status: 'PROCESSING' } : item)
-      } : null);
+      const updateStatus = (status: any, analysis?: any) => {
+        setActiveProject(prev => prev ? {
+          ...prev,
+          photos: prev.photos.map(item => item.id === p.id ? { ...item, status, analysis: analysis || item.analysis } : item)
+        } : null);
+      };
 
       try {
+        // 1. Extraction (Find the raw bits)
+        updateStatus('COMPRESSING');
         const { thumbnailBlob } = await extractData(p.file!);
         
         if (!thumbnailBlob) throw new Error("No preview found in RAW");
 
-        const base64 = await blobToBase64(thumbnailBlob);
-        const analysis = await analyzePhoto(base64);
+        // 2. Sanitization (Clean & Resize via Canvas)
+        // This fixes corrupt Nikon headers and reduces size for API
+        const cleanBase64 = await sanitizeAndCompress(thumbnailBlob);
 
+        // 3. Analysis (Gemini)
+        updateStatus('ANALYZING');
+        const analysis = await analyzePhoto(cleanBase64);
+
+        if (analysis.reason === 'API_FAIL') {
+            throw new Error("API Key Invalid or Quota Exceeded");
+        }
+
+        // 4. Success
         setActiveProject(prev => prev ? {
           ...prev,
           photos: prev.photos.map(item => item.id === p.id ? { 
@@ -404,15 +352,12 @@ export default function App() {
           } : item)
         } : null);
 
-      } catch (err) {
+      } catch (err: any) {
         console.error("Processing failed for", p.name, err);
-        setActiveProject(prev => prev ? {
-          ...prev,
-          photos: prev.photos.map(item => item.id === p.id ? { ...item, status: 'FAILED' } : item)
-        } : null);
+        updateStatus('FAILED', { reason: err.message || "FAILED" });
       }
       
-      await new Promise(r => setTimeout(r, 500)); 
+      await new Promise(r => setTimeout(r, 200)); 
     }
     setIsProcessing(false);
   };
@@ -521,19 +466,4 @@ export default function App() {
                 <Save size={12} /> BACKUP
               </button>
               <div className="h-4 w-px bg-white/10"></div>
-              <div className="text-[10px] tracking-widest text-[#d4c5a9] font-black uppercase">{activeProject.photos.filter(p => p.selected).length} KEEPS</div>
-            </div>
-            <button 
-              onClick={handleExportXMP}
-              disabled={isExporting}
-              className="bg-white hover:bg-[#d4c5a9] text-black text-[10px] font-black tracking-widest uppercase px-8 py-2.5 rounded-full transition-all flex items-center gap-3 disabled:opacity-50"
-            >
-              {isExporting ? <Loader2 className="animate-spin" size={12} /> : 'EXPORT XMP'}
-              <ArrowRight size={14} />
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
+              <div className="text-[10px] tracking-widest text-[#d4
