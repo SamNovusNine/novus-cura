@@ -1,29 +1,36 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
   ArrowRight, Loader2, Star, Save, FileCode, ArrowLeft, Edit2, Search, 
-  Layers, ChevronLeft, History, FileImage
+  Layers, ChevronLeft, History, FileImage, RotateCw
 } from 'lucide-react';
 import exifr from 'exifr';
 import JSZip from 'jszip';
 import { PhotoMission, PhotoAnalysis, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
-const STORAGE_KEY = 'novus_cura_studio_v22_restored';
+const STORAGE_KEY = 'novus_cura_studio_v23_autorotate';
 
-// --- UTILITY: Sanitizer (The Fix for API_FAIL) ---
-// Renders the RAW preview to a canvas and shrinks it to <1MB for Gemini
-const sanitizeAndCompress = (blob: Blob): Promise<string> => {
+// --- UTILITY: Sanitizer & Auto-Rotator ---
+// fixes orientation and compresses to <1MB for Gemini
+const sanitizeAndCompress = (blob: Blob, orientation: number = 1): Promise<string> => {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(blob);
     
     img.onload = () => {
       const canvas = document.createElement('canvas');
-      // Resize to max 1024px (Perfect for AI)
+      const ctx = canvas.getContext('2d');
       const MAX_SIZE = 1024;
+      
       let width = img.width;
       let height = img.height;
 
+      // Swap dimensions if rotated 90 or 270 degrees
+      if (orientation >= 5 && orientation <= 8) {
+        [width, height] = [height, width];
+      }
+
+      // Resize logic
       if (width > height) {
         if (width > MAX_SIZE) { height *= MAX_SIZE / width; width = MAX_SIZE; }
       } else {
@@ -32,35 +39,48 @@ const sanitizeAndCompress = (blob: Blob): Promise<string> => {
 
       canvas.width = width;
       canvas.height = height;
-      
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(img, 0, 0, width, height);
-        // Export clean JPEG at 80% quality
-        const base64 = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
-        resolve(base64);
-      } else {
-        reject(new Error("Canvas context failed"));
+
+      if (!ctx) { reject(new Error("Canvas failed")); return; }
+
+      // Handle Rotation
+      switch (orientation) {
+        case 2: ctx.transform(-1, 0, 0, 1, width, 0); break;
+        case 3: ctx.transform(-1, 0, 0, -1, width, height); break;
+        case 4: ctx.transform(1, 0, 0, -1, 0, height); break;
+        case 5: ctx.transform(0, 1, 1, 0, 0, 0); break;
+        case 6: ctx.transform(0, 1, -1, 0, width, 0); break;
+        case 7: ctx.transform(0, -1, -1, 0, width, height); break;
+        case 8: ctx.transform(0, -1, 1, 0, 0, height); break;
+        default: break;
       }
+
+      // Draw image (if 90/270 rotation, draw using original dims)
+      if (orientation >= 5 && orientation <= 8) {
+        ctx.drawImage(img, 0, 0, height, width); 
+      } else {
+        ctx.drawImage(img, 0, 0, width, height);
+      }
+
+      const base64 = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+      resolve(base64);
       URL.revokeObjectURL(url);
     };
 
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error("Image corrupt"));
-    };
-
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Image corrupt")); };
     img.src = url;
   });
 };
 
-// --- ENGINE: The "Deep Search" Extraction (Nikon D850 Fix) ---
-const extractMetadata = async (file: File): Promise<{ url: string | null; meta: PhotoMetadata; blob: Blob | null }> => {
+// --- ENGINE: Deep Search + Orientation Metadata ---
+const extractMetadata = async (file: File): Promise<{ url: string | null; meta: PhotoMetadata; blob: Blob | null; orientation: number }> => {
   try {
-    // 1. Basic Metadata
     let meta: PhotoMetadata = { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() };
+    let orientation = 1;
+
     try {
+      // Parse with explicit rotation check
       const exif = await exifr.parse(file, { tiff: true, ifd0: true, exif: true, makerNote: true });
+      orientation = exif?.Orientation || 1;
       meta = {
         iso: exif?.ISO?.toString() || '100',
         aperture: exif?.FNumber ? `f/${exif.FNumber}` : 'f/2.8',
@@ -69,54 +89,42 @@ const extractMetadata = async (file: File): Promise<{ url: string | null; meta: 
       };
     } catch (e) { /* ignore */ }
 
-    // 2. Preview Extraction (Waterfall)
+    // Preview Extraction (Waterfall)
     let thumbBuffer: ArrayBuffer | undefined = undefined;
-
-    // A. Try Library Preview
     try { thumbBuffer = await exifr.preview(file); } catch (e) {}
-    
-    // B. Try Library Thumbnail
-    if (!thumbBuffer) {
-      try { thumbBuffer = await exifr.thumbnail(file); } catch (e) {}
-    }
+    if (!thumbBuffer) try { thumbBuffer = await exifr.thumbnail(file); } catch (e) {}
 
-    // C. Manual Nikon Scan (The "Brute Force" Fallback)
+    // Manual Nikon Scan
     if (!thumbBuffer) {
       try {
-        // Read first 20MB
         const buffer = await file.slice(0, 20 * 1024 * 1024).arrayBuffer();
         const view = new DataView(buffer);
         let start = -1;
-        
-        // Scan for JPEG Header (FF D8 followed by FF)
         for (let i = 0; i < buffer.byteLength - 1; i++) {
-          if (view.getUint8(i) === 0xFF && view.getUint8(i+1) === 0xD8) {
-             if (view.getUint8(i+2) === 0xFF) { start = i; break; }
+          if (view.getUint8(i) === 0xFF && view.getUint8(i+1) === 0xD8 && view.getUint8(i+2) === 0xFF) {
+             start = i; break;
           }
         }
-        
-        if (start !== -1) {
-          // Grab a 5MB chunk. The Sanitizer will clean the end.
-          thumbBuffer = buffer.slice(start, start + 5 * 1024 * 1024);
-        }
+        if (start !== -1) thumbBuffer = buffer.slice(start, start + 5 * 1024 * 1024);
       } catch (e) {}
     }
 
-    // 3. Return Results
     if (thumbBuffer) {
       const blob = new Blob([thumbBuffer], { type: 'image/jpeg' });
-      const url = URL.createObjectURL(blob);
-      return { url, meta, blob };
+      // NOTE: We do NOT create a URL here yet. We let the Sanitizer create the rotated URL later.
+      // But for immediate display, we create a temporary one (it will be sideways until processed).
+      // Actually, let's return the blob and let the Sanitizer fix it in the main loop.
+      // We return a raw URL just for the initial "flash", but real fix happens in process loop.
+      const url = URL.createObjectURL(blob); 
+      return { url, meta, blob, orientation };
     }
     
-    return { url: null, meta, blob: null };
-
+    return { url: null, meta, blob: null, orientation: 1 };
   } catch (err) {
-    return { url: null, meta: { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() }, blob: null };
+    return { url: null, meta: { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() }, blob: null, orientation: 1 };
   }
 };
 
-// --- XMP Generation ---
 const generateXMP = (photo: PhotoMission): string => {
   const { exposure = 0, temp = 0, rating = 0, highlights = 0, shadows = 0, whites = 0, blacks = 0, contrast = 0 } = photo.analysis || {};
   const isoVal = parseInt(photo.metadata?.iso || '0');
@@ -133,7 +141,7 @@ const generateXMP = (photo: PhotoMission): string => {
  </rdf:RDF></x:xmpmeta><?xpacket end="w"?>`;
 };
 
-// --- COMPONENTS (Restored Original Design) ---
+// --- COMPONENTS ---
 
 const StarRating: React.FC<{ rating: number; onRate: (r: number) => void; interactive?: boolean; }> = ({ rating, onRate, interactive = false }) => {
   return (
@@ -143,9 +151,7 @@ const StarRating: React.FC<{ rating: number; onRate: (r: number) => void; intera
           <Star size={12} className={`${star <= rating ? 'fill-[#d4c5a9] text-[#d4c5a9]' : 'text-white/10'}`} strokeWidth={star <= rating ? 0 : 2} />
         </button>
       ))}
-      {interactive && (
-        <button onClick={(e) => { e.stopPropagation(); onRate(0); }} className="ml-2 text-[8px] font-mono-data text-white/30 uppercase tracking-widest font-black hover:text-white transition-colors">CL</button>
-      )}
+      {interactive && <button onClick={(e) => { e.stopPropagation(); onRate(0); }} className="ml-2 text-[8px] font-mono-data text-white/30 uppercase tracking-widest font-black hover:text-white transition-colors">CL</button>}
     </div>
   );
 };
@@ -189,24 +195,31 @@ const Header: React.FC<{ count: number; total: number; projectName?: string; onR
 
 const PhotoCard: React.FC<{ photo: PhotoMission; onToggle: (id: string) => void; onRate: (id: string, rating: number) => void; stackCount?: number; onClick?: () => void; }> = ({ photo, onToggle, onRate, stackCount, onClick }) => {
   const isCompleted = photo.status === 'COMPLETED';
+  const isAnalyzing = photo.status === 'PROCESSING' || photo.status === 'PENDING';
   const isSelected = photo.selected;
 
   return (
     <div onClick={() => onClick ? onClick() : onToggle(photo.id)} className={`group relative aspect-[3/4] bg-[#0a0a0a] overflow-hidden cursor-pointer transition-all duration-500 border ${isSelected ? 'border-[#d4c5a9]' : 'border-white/5 hover:border-white/20'}`}>
       {photo.previewUrl ? (
-        <img src={photo.previewUrl} alt={photo.name} className={`w-full h-full object-cover transition-all duration-700 ${isSelected ? 'brightness-110' : 'brightness-50 group-hover:brightness-90'}`} />
+        <>
+          <img src={photo.previewUrl} alt={photo.name} className={`w-full h-full object-cover transition-all duration-700 ${isSelected ? 'brightness-110' : 'brightness-50 group-hover:brightness-90'} ${photo.status === 'FAILED' ? 'opacity-20' : 'opacity-100'}`} />
+          {/* Processing Overlay */}
+          {isAnalyzing && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40 backdrop-blur-[2px] animate-pulse">
+              <Loader2 className="text-[#d4c5a9] animate-spin mb-2" size={20} />
+              <span className="text-[8px] font-mono-data text-[#d4c5a9] tracking-widest uppercase font-black">AI ANALYZING...</span>
+            </div>
+          )}
+        </>
       ) : (
         <div className="w-full h-full bg-[#1a1a1a] flex flex-col items-center justify-center gap-3">
           <FileCode size={24} className="text-white/20" />
-          <p className="text-[8px] font-mono-data text-white/30 uppercase font-black">
-            {photo.status === 'FAILED' ? 'PREVIEW ERROR' : 'LOADING...'}
-          </p>
+          <p className="text-[8px] font-mono-data text-white/30 uppercase font-black">{photo.status === 'FAILED' ? 'FILE ERROR' : 'LOADING...'}</p>
         </div>
       )}
-      {stackCount && stackCount > 1 && (
-        <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5 bg-black/60 backdrop-blur-md px-2 py-1 rounded-full border border-white/10"><Layers size={10} className="text-[#d4c5a9]" /><span className="text-[8px] font-mono-data font-black text-white">{stackCount}</span></div>
-      )}
+      {stackCount && stackCount > 1 && <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5 bg-black/60 backdrop-blur-md px-2 py-1 rounded-full border border-white/10"><Layers size={10} className="text-[#d4c5a9]" /><span className="text-[8px] font-mono-data font-black text-white">{stackCount}</span></div>}
       {isSelected && <div className="absolute top-3 right-3 z-20"><div className="w-2.5 h-2.5 rounded-full bg-[#d4c5a9] shadow-[0_0_15px_rgba(212,197,169,0.5)]" /></div>}
+      
       <div className="absolute inset-0 bg-gradient-to-t from-black via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-5">
         <div className="space-y-3">
           <div className="space-y-0.5">
@@ -259,38 +272,52 @@ export default function App() {
     let currentProject = activeProject || { id: Date.now().toString(), name: `PRODUCTION ${new Date().toLocaleDateString()}`, createdAt: Date.now(), lastModified: Date.now(), photos: [] };
     const newPhotos: PhotoMission[] = [];
     
+    // 1. Initial Ingest (Fast)
     for (const file of fileArray) {
-      const { url, meta, blob } = await extractMetadata(file);
+      const { url, meta, blob, orientation } = await extractMetadata(file);
       newPhotos.push({ 
-        id: Math.random().toString(36).substr(2, 9), 
-        name: file.name, file, previewUrl: url, 
+        id: Math.random().toString(36).substr(2, 9), name: file.name, file, previewUrl: url, 
         status: 'PENDING', metadata: meta, selected: false,
-        _tempBlob: blob // Store blob temporarily for AI
+        _tempBlob: blob, _orientation: orientation // Store for later
       });
     }
 
     setActiveProject({ ...currentProject, photos: [...currentProject.photos, ...newPhotos] });
 
+    // 2. AI Processing Loop
     for (let i = 0; i < newPhotos.length; i++) {
       const p = newPhotos[i];
-      if (i > 0) await new Promise(r => setTimeout(r, 200));
+      // Delay to avoid rate limits
+      if (i > 0) await new Promise(r => setTimeout(r, 1500)); 
 
       try {
         if (!p._tempBlob) throw new Error("No preview extracted");
 
-        // 1. Sanitize & Compress (Fixes API Payload Size)
-        const cleanBase64 = await sanitizeAndCompress(p._tempBlob);
+        // Set status to Processing
+        setActiveProject(prev => prev ? {
+            ...prev, photos: prev.photos.map(x => x.id === p.id ? { ...x, status: 'PROCESSING' } : x)
+        } : null);
 
-        // 2. Analyze (Using Gemini 1.5 Flash)
+        // Auto-Rotate & Resize
+        const cleanBase64 = await sanitizeAndCompress(p._tempBlob, p._orientation || 1);
+
+        // AI Analyze
         const analysis = await analyzePhoto(cleanBase64);
         
+        // Update Final State (Fix rotation in UI too)
+        const rotatedUrl = `data:image/jpeg;base64,${cleanBase64}`;
+
         setActiveProject(prev => prev ? {
           ...prev,
           photos: prev.photos.map(item => item.id === p.id ? { 
-            ...item, status: 'COMPLETED', analysis, selected: (analysis.rating || 0) >= 3 
+            ...item, status: 'COMPLETED', analysis, 
+            previewUrl: rotatedUrl, // Update preview to the rotated version
+            selected: (analysis.rating || 0) >= 3 
           } : item)
         } : null);
+
       } catch (err) {
+        console.error(err);
         setActiveProject(prev => prev ? {
           ...prev,
           photos: prev.photos.map(item => item.id === p.id ? { ...item, status: 'FAILED' } : item)
@@ -302,14 +329,8 @@ export default function App() {
   };
 
   const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); };
-  const handleDragLeave = (e: React.DragEvent) => { 
-    e.preventDefault(); e.stopPropagation(); 
-    if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsDragging(false); 
-  };
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault(); e.stopPropagation(); setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) processFiles(e.dataTransfer.files);
-  };
+  const handleDragLeave = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsDragging(false); };
+  const handleDrop = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); if (e.dataTransfer.files && e.dataTransfer.files.length > 0) processFiles(e.dataTransfer.files); };
 
   const filteredPhotos = useMemo(() => {
     if (!activeProject) return [];
