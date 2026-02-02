@@ -1,10 +1,10 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
-  ArrowRight, Loader2, Star, Trash2, History, Save, FileCode, ArrowLeft, Edit2, Search, Layers, ChevronLeft
+  ArrowRight, Loader2, Star, Save, FileCode, ArrowLeft, Edit2, Search, Layers, ChevronLeft, History
 } from 'lucide-react';
 import exifr from 'exifr';
 import JSZip from 'jszip';
-import { PhotoMission, PhotoAnalysis, PhotoMetadata, Project } from './types';
+import { PhotoMission, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
 const STORAGE_KEY = 'novus_cura_studio_v13';
@@ -63,15 +63,11 @@ const generateXMP = (photo: PhotoMission): string => {
 // --- Engine: Extract RAW Preview & Metadata ---
 const extractMetadata = async (file: File): Promise<{ url: string | null; meta: PhotoMetadata }> => {
   try {
-    // Aggressive parsing for NEF/CR3 files
+    // 1. Get Metadata (Fast)
     const exif = await exifr.parse(file, {
       tiff: true,
-      ifd0: true, // often contains the preview pointer
-      ifd1: true,
+      ifd0: true,
       exif: true,
-      gps: false,
-      interop: false,
-      mergeOutput: true 
     });
 
     const meta: PhotoMetadata = {
@@ -81,23 +77,26 @@ const extractMetadata = async (file: File): Promise<{ url: string | null; meta: 
       timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
     };
 
-    // Attempt 1: Standard thumbnail
-    let previewUrl = await exifr.thumbnailUrl(file);
+    // 2. Aggressive Preview Extraction
+    let previewUrl: string | null = null;
+    
+    // Attempt A: Standard Thumbnail
+    try {
+      previewUrl = await exifr.thumbnailUrl(file);
+    } catch (e) { /* continue */ }
 
-    // Attempt 2: If no thumbnail, try to find larger preview image often hidden in RAWs
+    // Attempt B: Deep Preview (Better for NEF/CR3)
     if (!previewUrl) {
       try {
         const previewBuffer = await exifr.preview(file);
         if (previewBuffer) {
-            previewUrl = URL.createObjectURL(new Blob([previewBuffer]));
+           previewUrl = URL.createObjectURL(new Blob([previewBuffer]));
         }
-      } catch (e) {
-        // Ignore preview extraction errors
-      }
+      } catch (e) { /* continue */ }
     }
 
-    // Attempt 3: Fallback for standard web images
-    if (!previewUrl && (file.type.includes('image') || /\.(jpg|jpeg|png|webp)$/i.test(file.name))) {
+    // Attempt C: Fallback for web images
+    if (!previewUrl && (file.type.startsWith('image/') || /\.(jpg|png|webp)$/i.test(file.name))) {
       previewUrl = URL.createObjectURL(file);
     }
     
@@ -151,7 +150,6 @@ const Header: React.FC<{
 }> = ({ count, total, projectName, onRename, onBack, onShowHistory, searchQuery, onSearch }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [tempName, setTempName] = useState(projectName || '');
-  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { if (projectName) setTempName(projectName); }, [projectName]);
 
@@ -174,16 +172,13 @@ const Header: React.FC<{
             <div className="flex items-center gap-2 group">
               {isEditing ? (
                 <input
-                  ref={inputRef} autoFocus
+                  autoFocus
                   className="bg-transparent border-b border-[#d4c5a9] text-[9px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-bold focus:outline-none py-0 px-0"
                   value={tempName} onChange={(e) => setTempName(e.target.value)}
                   onBlur={handleSubmit} onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
                 />
               ) : (
-                <button 
-                  onClick={() => setIsEditing(true)}
-                  className="text-[9px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-bold hover:text-white transition-all flex items-center gap-2"
-                >
+                <button onClick={() => setIsEditing(true)} className="text-[9px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-bold hover:text-white transition-all flex items-center gap-2">
                   {projectName} <Edit2 size={10} className="opacity-0 group-hover:opacity-100 transition-opacity" />
                 </button>
               )}
@@ -195,7 +190,7 @@ const Header: React.FC<{
         <div className="relative group">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-white/20 group-focus-within:text-[#d4c5a9] transition-colors" size={14} />
           <input 
-            type="text" placeholder="SEMANTIC SEARCH (E.G. 'BRIDE', 'FOOD', 'OUTDOORS')"
+            type="text" placeholder="SEMANTIC SEARCH..."
             className="w-full bg-white/[0.03] border border-white/5 rounded-full py-2 pl-10 pr-4 text-[9px] font-mono-data tracking-widest uppercase text-white placeholder:text-white/10 focus:outline-none focus:border-white/20 transition-all"
             value={searchQuery} onChange={(e) => onSearch(e.target.value)}
           />
@@ -221,7 +216,6 @@ const PhotoCard: React.FC<{
   photo: PhotoMission; onToggle: (id: string) => void; 
   onRate: (id: string, rating: number) => void; stackCount?: number; onClick?: () => void;
 }> = ({ photo, onToggle, onRate, stackCount, onClick }) => {
-  const isCompleted = photo.status === 'COMPLETED';
   const isSelected = photo.selected;
   const [imgError, setImgError] = useState(false);
 
@@ -268,7 +262,7 @@ const PhotoCard: React.FC<{
               {photo.metadata?.shutter} • {photo.metadata?.aperture} • ISO {photo.metadata?.iso}
             </p>
           </div>
-          {isCompleted && (
+          {photo.status === 'COMPLETED' && (
             <div className="pt-2 border-t border-white/10 space-y-2">
               <StarRating rating={photo.analysis?.rating || 0} onRate={(r) => onRate(photo.id, r)} interactive />
               <p className="text-[7px] text-white/30 font-black uppercase tracking-widest line-clamp-2">{photo.analysis?.caption}</p>
@@ -309,7 +303,6 @@ export default function App() {
     }
   }, [activeProject]);
 
-  // --- Core Processing Logic ---
   const processFiles = async (files: FileList) => {
     const fileArray = Array.from(files);
     if (fileArray.length === 0) return;
@@ -341,10 +334,9 @@ export default function App() {
 
     setActiveProject({ ...currentProject, photos: [...currentProject.photos, ...newPhotos] });
 
-    // --- AI Queue ---
     for (let i = 0; i < newPhotos.length; i++) {
       const p = newPhotos[i];
-      if (i > 0) await new Promise(r => setTimeout(r, 1000)); // Throttle
+      if (i > 0) await new Promise(r => setTimeout(r, 1000));
 
       try {
         const base64 = await fileToBase64(p.file!);
@@ -369,17 +361,25 @@ export default function App() {
     setTimeout(() => setIsProcessingView(false), 500);
   };
 
-  // --- Drag & Drop Handlers ---
+  // --- FIXED DRAG & DROP ---
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     setIsDragging(true);
   };
+
   const handleDragLeave = (e: React.DragEvent) => {
     e.preventDefault();
-    setIsDragging(false);
+    e.stopPropagation();
+    // Only turn off if we left the *window* or the main container, not child elements
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      setIsDragging(false);
+    }
   };
+
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     setIsDragging(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       processFiles(e.dataTransfer.files);
@@ -436,8 +436,11 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#050505] text-white selection:bg-[#d4c5a9] selection:text-black font-mono-data"
-      onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
+    <div 
+      className="min-h-screen bg-[#050505] text-white selection:bg-[#d4c5a9] selection:text-black font-mono-data"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
     >
       <Header 
         count={activeProject?.photos.filter(p => p.selected).length || 0} 
@@ -450,9 +453,9 @@ export default function App() {
       />
 
       <main className="pt-16 pb-32 min-h-screen flex flex-col relative">
-        {/* Global Drag Overlay */}
+        {/* Global Drag Overlay (Fixed Glitch) */}
         {isDragging && (
-          <div className="absolute inset-0 z-50 bg-[#050505]/90 flex items-center justify-center backdrop-blur-sm border-2 border-[#d4c5a9] m-4 rounded-3xl animate-pulse">
+          <div className="absolute inset-0 z-50 bg-[#050505]/90 flex items-center justify-center backdrop-blur-sm border-2 border-[#d4c5a9] m-4 rounded-3xl animate-pulse pointer-events-none">
             <p className="text-2xl font-mono-data font-black text-[#d4c5a9] tracking-[0.5em] uppercase">
               RELEASE TO IMPORT
             </p>
@@ -471,9 +474,7 @@ export default function App() {
           </div>
         ) : !activeProject || activeProject.photos.length === 0 ? (
           <div className="flex-grow flex flex-col items-center justify-center cursor-pointer px-12 group" onClick={() => fileInputRef.current?.click()}>
-            <div className={`w-full max-w-3xl aspect-[16/6] border flex flex-col items-center justify-center gap-6 relative transition-all duration-500
-              ${isDragging ? 'border-[#d4c5a9] bg-[#d4c5a9]/5 scale-105' : 'border-white/5 group-hover:border-white/20'}
-            `}>
+            <div className={`w-full max-w-3xl aspect-[16/6] border flex flex-col items-center justify-center gap-6 relative transition-all duration-500 border-white/5 group-hover:border-white/20`}>
               <div className="text-center space-y-3 pointer-events-none">
                 <p className="text-xl tracking-[0.2em] text-white font-black uppercase">DROP PRODUCTION ASSETS</p>
                 <p className="text-[9px] text-white/20 uppercase tracking-widest">RAW • JPG • NEF • CR3</p>
