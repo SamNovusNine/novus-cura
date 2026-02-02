@@ -8,7 +8,7 @@ import JSZip from 'jszip';
 import { PhotoMission, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
-const STORAGE_KEY = 'novus_cura_studio_v16_final';
+const STORAGE_KEY = 'novus_cura_studio_v17_manual_slice';
 
 // --- Utility: Blob to Base64 (For AI Analysis) ---
 const blobToBase64 = (blob: Blob): Promise<string> => {
@@ -62,43 +62,76 @@ const generateXMP = (photo: PhotoMission): string => {
 <?xpacket end="w"?>`;
 };
 
-// --- Engine: Extract Metadata & Preview BLOB (AGGRESSIVE MODE) ---
+// --- Engine: The "Manual Surgeon" Extraction ---
+// Uses byte-level slicing to extract embedded JPEGs from Nikon/Sony/Canon RAWs
 const extractData = async (file: File): Promise<{ thumbnailBlob: Blob | null; meta: PhotoMetadata }> => {
   try {
-    // 1. Parse Metadata (Lightweight)
-    // We disable 'tiff' here to speed up just reading the ISO/Shutter
-    const exif = await exifr.parse(file, {
+    // 1. Parse Metadata + offsets (Do not merge output, keep IFDs separate)
+    // We explicitly ask for "tiff" structural data to find the JpgFromRaw offsets
+    const output = await exifr.parse(file, {
       tiff: true,
       ifd0: true,
+      ifd1: true,
       exif: true,
-      xmp: false // Skip XMP for speed, we only need basic EXIF
+      xmp: false,
+      mergeOutput: false // CRITICAL: Keeps IFD structure so we can find hidden offsets
     });
 
+    // Flatten metadata for UI
+    const combined = { ...output.ifd0, ...output.exif, ...output.ifd1 };
     const meta: PhotoMetadata = {
-      iso: exif?.ISO?.toString() || '100',
-      aperture: exif?.FNumber ? `f/${exif.FNumber}` : 'f/2.8',
-      shutter: exif?.ExposureTime ? `1/${Math.round(1/exif.ExposureTime)}` : '1/250',
-      timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
+      iso: combined?.ISO?.toString() || '100',
+      aperture: combined?.FNumber ? `f/${combined.FNumber}` : 'f/2.8',
+      shutter: combined?.ExposureTime ? `1/${Math.round(1/combined.ExposureTime)}` : '1/250',
+      timestamp: combined?.DateTimeOriginal ? new Date(combined.DateTimeOriginal).getTime() : Date.now()
     };
 
-    // 2. Extract Binary Image for AI (The Waterfall Method)
-    let thumbnailBlob: Blob | null = null;
-    let thumbBuffer: ArrayBuffer | undefined = undefined;
+    // 2. The Manual Slice Strategy (Finding the hidden JPEG bytes)
+    let start: number | undefined;
+    let length: number | undefined;
 
-    try {
-      // PRIORITY 1: High-Res Preview (Nikon .NEF & Sony .ARW usually live here)
-      thumbBuffer = await exifr.preview(file);
-    } catch (e) { /* Continue to fallback */ }
-
-    if (!thumbBuffer) {
-      try {
-        // PRIORITY 2: Standard Thumbnail (Fuji .RAF & Canon often live here)
-        thumbBuffer = await exifr.thumbnail(file);
-      } catch (e) { /* Continue to fail state */ }
+    // Strategy A: Nikon D850 / D5 / Z Series (JpgFromRaw in IFD0 or SubIFD)
+    if (output.ifd0?.JpgFromRawStart && output.ifd0?.JpgFromRawLength) {
+        start = output.ifd0.JpgFromRawStart;
+        length = output.ifd0.JpgFromRawLength;
+    } 
+    // Strategy B: Sony ARW (PreviewImageStart)
+    else if (output.ifd0?.PreviewImageStart && output.ifd0?.PreviewImageLength) {
+        start = output.ifd0.PreviewImageStart;
+        length = output.ifd0.PreviewImageLength;
+    }
+    // Strategy C: Standard TIFF/Canon (ThumbnailOffset in IFD1)
+    else if (output.ifd1?.ThumbnailOffset && output.ifd1?.ThumbnailLength) {
+        start = output.ifd1.ThumbnailOffset;
+        length = output.ifd1.ThumbnailLength;
+    }
+    // Strategy D: Fallback for older Nikon (StripOffsets in IFD1)
+    else if (output.ifd1?.StripOffsets && output.ifd1?.StripByteCounts) {
+        start = Array.isArray(output.ifd1.StripOffsets) ? output.ifd1.StripOffsets[0] : output.ifd1.StripOffsets;
+        length = Array.isArray(output.ifd1.StripByteCounts) ? output.ifd1.StripByteCounts[0] : output.ifd1.StripByteCounts;
     }
 
-    if (thumbBuffer) {
-      thumbnailBlob = new Blob([thumbBuffer], { type: 'image/jpeg' });
+    let thumbnailBlob: Blob | null = null;
+
+    if (start && length) {
+        // DIRECT SURGERY: Slice the bytes directly from the file
+        // This is 100% accurate because it uses the camera's own map
+        try {
+            const blobPart = file.slice(start, start + length);
+            thumbnailBlob = new Blob([blobPart], { type: 'image/jpeg' });
+        } catch (e) {
+            console.warn("Slice failed", e);
+        }
+    }
+
+    // 3. Last Resort: Library Helper (If manual slice failed)
+    if (!thumbnailBlob) {
+        try {
+            const buffer = await exifr.thumbnail(file);
+            if (buffer) thumbnailBlob = new Blob([buffer], { type: 'image/jpeg' });
+        } catch (e) {
+            // Silently fail
+        }
     }
 
     return { thumbnailBlob, meta };
@@ -262,7 +295,7 @@ const PhotoRow: React.FC<{
              </div>
            ) : photo.status === 'FAILED' ? (
              <span className="text-[9px] text-red-500/50 font-mono-data uppercase tracking-widest">
-               NO EMBEDDED PREVIEW FOUND (CHECK CAMERA SETTINGS)
+               RAW PREVIEW EXTRACTION FAILED - FILE UNREADABLE
              </span>
            ) : (
              <span className="text-[9px] text-white/10 font-mono-data uppercase tracking-widest">WAITING FOR INTELLIGENCE...</span>
@@ -320,6 +353,8 @@ export default function App() {
 
     const newPhotos: PhotoMission[] = [];
     for (const file of fileArray) {
+      // NOTE: We do NOT extract the Blob here to save memory in the main state
+      // We only extract Metadata for the UI list
       const { meta } = await extractData(file); 
       newPhotos.push({
         id: Math.random().toString(36).substr(2, 9),
@@ -344,13 +379,18 @@ export default function App() {
       } : null);
 
       try {
+        // A. Extract ACTUAL Thumbnail Blob for AI using Manual Surgery
         const { thumbnailBlob } = await extractData(p.file!);
         
         if (!thumbnailBlob) throw new Error("No preview found in RAW");
 
+        // B. Convert Thumbnail to Base64 (Small payload)
         const base64 = await blobToBase64(thumbnailBlob);
+
+        // C. Send to Gemini
         const analysis = await analyzePhoto(base64);
 
+        // D. Success
         setActiveProject(prev => prev ? {
           ...prev,
           photos: prev.photos.map(item => item.id === p.id ? { 
