@@ -1,17 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
-  ArrowRight, 
-  Loader2,
-  Star,
-  Trash2,
-  History,
-  Save,
-  FileCode,
-  ArrowLeft,
-  Edit2,
-  Search,
-  Layers,
-  ChevronLeft
+  ArrowRight, Loader2, Star, Trash2, History, Save, FileCode, ArrowLeft, Edit2, Search, Layers, ChevronLeft
 } from 'lucide-react';
 import exifr from 'exifr';
 import JSZip from 'jszip';
@@ -36,14 +25,8 @@ const fileToBase64 = (file: File): Promise<string> => {
 // --- XMP Generation Engine ---
 const generateXMP = (photo: PhotoMission): string => {
   const { 
-    exposure = 0, 
-    temp = 0, 
-    rating = 0, 
-    highlights = 0, 
-    shadows = 0, 
-    whites = 0, 
-    blacks = 0,
-    contrast = 0 
+    exposure = 0, temp = 0, rating = 0, highlights = 0, 
+    shadows = 0, whites = 0, blacks = 0, contrast = 0 
   } = photo.analysis || {};
   
   const isoVal = parseInt(photo.metadata?.iso || '0');
@@ -80,14 +63,15 @@ const generateXMP = (photo: PhotoMission): string => {
 // --- Engine: Extract RAW Preview & Metadata ---
 const extractMetadata = async (file: File): Promise<{ url: string | null; meta: PhotoMetadata }> => {
   try {
-    // 1. Parse Metadata First
+    // Aggressive parsing for NEF/CR3 files
     const exif = await exifr.parse(file, {
       tiff: true,
-      ifd0: true,
+      ifd0: true, // often contains the preview pointer
       ifd1: true,
       exif: true,
       gps: false,
       interop: false,
+      mergeOutput: true 
     });
 
     const meta: PhotoMetadata = {
@@ -97,25 +81,29 @@ const extractMetadata = async (file: File): Promise<{ url: string | null; meta: 
       timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
     };
 
-    // 2. Attempt Preview Extraction
-    let previewUrl: string | null = null;
-    
-    try {
-      // Force prioritize the largest JPEG preview available
-      // .nef and .cr3 often keep the good preview in 'preview' or 'JpgFromRaw'
-      previewUrl = await exifr.thumbnailUrl(file);
-    } catch (e) {
-      console.warn('Exifr thumbnail extraction failed, falling back...');
+    // Attempt 1: Standard thumbnail
+    let previewUrl = await exifr.thumbnailUrl(file);
+
+    // Attempt 2: If no thumbnail, try to find larger preview image often hidden in RAWs
+    if (!previewUrl) {
+      try {
+        const previewBuffer = await exifr.preview(file);
+        if (previewBuffer) {
+            previewUrl = URL.createObjectURL(new Blob([previewBuffer]));
+        }
+      } catch (e) {
+        // Ignore preview extraction errors
+      }
     }
 
-    // 3. Fallback for Standard Images (JPG/PNG)
-    if (!previewUrl && (file.type === 'image/jpeg' || file.type === 'image/png' || file.type === 'image/webp')) {
+    // Attempt 3: Fallback for standard web images
+    if (!previewUrl && (file.type.includes('image') || /\.(jpg|jpeg|png|webp)$/i.test(file.name))) {
       previewUrl = URL.createObjectURL(file);
     }
     
     return { url: previewUrl || null, meta };
   } catch (err) {
-    console.warn(`Extraction failed completely for ${file.name}:`, err);
+    console.warn(`Metadata extraction failed for ${file.name}:`, err);
     return { 
       url: null, 
       meta: { iso: '100', aperture: 'f/2.8', shutter: '1/250', timestamp: Date.now() } 
@@ -134,10 +122,7 @@ const StarRating: React.FC<{
         <button
           key={star}
           disabled={!interactive}
-          onClick={(e) => {
-            e.stopPropagation();
-            onRate(star);
-          }}
+          onClick={(e) => { e.stopPropagation(); onRate(star); }}
           className={`transition-all ${interactive ? 'hover:scale-125' : 'cursor-default'}`}
         >
           <Star 
@@ -149,10 +134,7 @@ const StarRating: React.FC<{
       ))}
       {interactive && (
         <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onRate(0);
-          }}
+          onClick={(e) => { e.stopPropagation(); onRate(0); }}
           className="ml-2 text-[8px] font-mono-data text-white/30 uppercase tracking-widest font-black hover:text-white transition-colors"
         >
           CL
@@ -163,27 +145,18 @@ const StarRating: React.FC<{
 };
 
 const Header: React.FC<{ 
-  count: number; 
-  total: number; 
-  projectName?: string; 
-  onRename?: (name: string) => void;
-  onBack?: () => void; 
-  onShowHistory?: () => void;
-  searchQuery: string;
-  onSearch: (q: string) => void;
+  count: number; total: number; projectName?: string; 
+  onRename?: (name: string) => void; onBack?: () => void; 
+  onShowHistory?: () => void; searchQuery: string; onSearch: (q: string) => void;
 }> = ({ count, total, projectName, onRename, onBack, onShowHistory, searchQuery, onSearch }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [tempName, setTempName] = useState(projectName || '');
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    if (projectName) setTempName(projectName);
-  }, [projectName]);
+  useEffect(() => { if (projectName) setTempName(projectName); }, [projectName]);
 
   const handleSubmit = () => {
-    if (tempName.trim() && onRename) {
-      onRename(tempName.trim());
-    }
+    if (tempName.trim() && onRename) onRename(tempName.trim());
     setIsEditing(false);
   };
 
@@ -201,41 +174,33 @@ const Header: React.FC<{
             <div className="flex items-center gap-2 group">
               {isEditing ? (
                 <input
-                  ref={inputRef}
-                  autoFocus
+                  ref={inputRef} autoFocus
                   className="bg-transparent border-b border-[#d4c5a9] text-[9px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-bold focus:outline-none py-0 px-0"
-                  value={tempName}
-                  onChange={(e) => setTempName(e.target.value)}
-                  onBlur={handleSubmit}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
+                  value={tempName} onChange={(e) => setTempName(e.target.value)}
+                  onBlur={handleSubmit} onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
                 />
               ) : (
                 <button 
                   onClick={() => setIsEditing(true)}
                   className="text-[9px] font-mono-data tracking-widest text-[#d4c5a9] uppercase font-bold hover:text-white transition-all flex items-center gap-2"
                 >
-                  {projectName}
-                  <Edit2 size={10} className="opacity-0 group-hover:opacity-100 transition-opacity" />
+                  {projectName} <Edit2 size={10} className="opacity-0 group-hover:opacity-100 transition-opacity" />
                 </button>
               )}
             </div>
           )}
         </div>
       </div>
-
       <div className="flex-grow max-w-xl px-12">
         <div className="relative group">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-white/20 group-focus-within:text-[#d4c5a9] transition-colors" size={14} />
           <input 
-            type="text"
-            placeholder="SEMANTIC SEARCH (E.G. 'BRIDE', 'FOOD', 'OUTDOORS')"
+            type="text" placeholder="SEMANTIC SEARCH (E.G. 'BRIDE', 'FOOD', 'OUTDOORS')"
             className="w-full bg-white/[0.03] border border-white/5 rounded-full py-2 pl-10 pr-4 text-[9px] font-mono-data tracking-widest uppercase text-white placeholder:text-white/10 focus:outline-none focus:border-white/20 transition-all"
-            value={searchQuery}
-            onChange={(e) => onSearch(e.target.value)}
+            value={searchQuery} onChange={(e) => onSearch(e.target.value)}
           />
         </div>
       </div>
-
       <div className="flex items-center gap-10">
         {onShowHistory && (
           <button onClick={onShowHistory} className="flex items-center gap-2 text-[10px] font-mono-data tracking-widest text-white/40 hover:text-white font-bold uppercase transition-all">
@@ -253,11 +218,8 @@ const Header: React.FC<{
 };
 
 const PhotoCard: React.FC<{ 
-  photo: PhotoMission; 
-  onToggle: (id: string) => void;
-  onRate: (id: string, rating: number) => void;
-  stackCount?: number;
-  onClick?: () => void;
+  photo: PhotoMission; onToggle: (id: string) => void; 
+  onRate: (id: string, rating: number) => void; stackCount?: number; onClick?: () => void;
 }> = ({ photo, onToggle, onRate, stackCount, onClick }) => {
   const isCompleted = photo.status === 'COMPLETED';
   const isSelected = photo.selected;
@@ -266,18 +228,12 @@ const PhotoCard: React.FC<{
   return (
     <div 
       onClick={() => onClick ? onClick() : onToggle(photo.id)}
-      className={`group relative aspect-[3/4] bg-[#0a0a0a] overflow-hidden cursor-pointer transition-all duration-500 border
-        ${isSelected ? 'border-[#d4c5a9]' : 'border-white/5 hover:border-white/20'}
-      `}
+      className={`group relative aspect-[3/4] bg-[#0a0a0a] overflow-hidden cursor-pointer transition-all duration-500 border ${isSelected ? 'border-[#d4c5a9]' : 'border-white/5 hover:border-white/20'}`}
     >
       {photo.previewUrl && !imgError ? (
         <img 
-          src={photo.previewUrl} 
-          alt={photo.name} 
-          onError={() => setImgError(true)}
-          className={`w-full h-full object-cover transition-all duration-700 
-            ${isSelected ? 'brightness-110' : 'brightness-50 group-hover:brightness-90'}
-          `}
+          src={photo.previewUrl} alt={photo.name} onError={() => setImgError(true)}
+          className={`w-full h-full object-cover transition-all duration-700 ${isSelected ? 'brightness-110' : 'brightness-50 group-hover:brightness-90'}`}
         />
       ) : (
         <div className="w-full h-full bg-[#1a1a1a] flex flex-col items-center justify-center gap-3">
@@ -333,6 +289,7 @@ export default function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedStackId, setExpandedStackId] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -352,6 +309,7 @@ export default function App() {
     }
   }, [activeProject]);
 
+  // --- Core Processing Logic ---
   const processFiles = async (files: FileList) => {
     const fileArray = Array.from(files);
     if (fileArray.length === 0) return;
@@ -383,11 +341,10 @@ export default function App() {
 
     setActiveProject({ ...currentProject, photos: [...currentProject.photos, ...newPhotos] });
 
+    // --- AI Queue ---
     for (let i = 0; i < newPhotos.length; i++) {
       const p = newPhotos[i];
-      
-      // Throttle: Small delay to avoid hitting 15 RPM burst limits on free tier
-      if (i > 0) await new Promise(r => setTimeout(r, 1000));
+      if (i > 0) await new Promise(r => setTimeout(r, 1000)); // Throttle
 
       try {
         const base64 = await fileToBase64(p.file!);
@@ -412,6 +369,23 @@ export default function App() {
     setTimeout(() => setIsProcessingView(false), 500);
   };
 
+  // --- Drag & Drop Handlers ---
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      processFiles(e.dataTransfer.files);
+    }
+  };
+
   const filteredPhotos = useMemo(() => {
     if (!activeProject) return [];
     if (!searchQuery.trim()) return activeProject.photos;
@@ -423,12 +397,10 @@ export default function App() {
     );
   }, [activeProject, searchQuery]);
 
-  // Burst Stacking Logic
   const stackedPhotos = useMemo(() => {
     if (searchQuery.trim() || expandedStackId) return filteredPhotos;
     const stacks: PhotoMission[][] = [];
     const sorted = [...filteredPhotos].sort((a, b) => (a.metadata?.timestamp || 0) - (b.metadata?.timestamp || 0));
-    
     sorted.forEach(p => {
       const lastStack = stacks[stacks.length - 1];
       if (lastStack && p.metadata?.timestamp && lastStack[0].metadata?.timestamp && 
@@ -438,12 +410,10 @@ export default function App() {
         stacks.push([p]);
       }
     });
-
     return stacks.map(stack => {
       if (stack.length === 1) return stack[0];
-      // Pick best rated, or first
       const best = [...stack].sort((a, b) => (b.analysis?.rating || 0) - (a.analysis?.rating || 0))[0];
-      return { ...best, _stack: stack }; // Attach virtual property
+      return { ...best, _stack: stack }; 
     });
   }, [filteredPhotos, searchQuery, expandedStackId]);
 
@@ -466,7 +436,9 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#050505] text-white selection:bg-[#d4c5a9] selection:text-black font-mono-data">
+    <div className="min-h-screen bg-[#050505] text-white selection:bg-[#d4c5a9] selection:text-black font-mono-data"
+      onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
+    >
       <Header 
         count={activeProject?.photos.filter(p => p.selected).length || 0} 
         total={activeProject?.photos.length || 0} 
@@ -474,11 +446,19 @@ export default function App() {
         onRename={(name) => activeProject && setActiveProject({...activeProject, name})}
         onBack={() => expandedStackId ? setExpandedStackId(null) : setActiveProject(null)} 
         onShowHistory={() => setShowHistory(true)}
-        searchQuery={searchQuery}
-        onSearch={setSearchQuery}
+        searchQuery={searchQuery} onSearch={setSearchQuery}
       />
 
-      <main className="pt-16 pb-32 min-h-screen flex flex-col">
+      <main className="pt-16 pb-32 min-h-screen flex flex-col relative">
+        {/* Global Drag Overlay */}
+        {isDragging && (
+          <div className="absolute inset-0 z-50 bg-[#050505]/90 flex items-center justify-center backdrop-blur-sm border-2 border-[#d4c5a9] m-4 rounded-3xl animate-pulse">
+            <p className="text-2xl font-mono-data font-black text-[#d4c5a9] tracking-[0.5em] uppercase">
+              RELEASE TO IMPORT
+            </p>
+          </div>
+        )}
+
         {isProcessingView ? (
           <div className="flex-grow flex flex-col items-center justify-center animate-in fade-in duration-500">
             <div className="text-center space-y-8">
@@ -491,7 +471,9 @@ export default function App() {
           </div>
         ) : !activeProject || activeProject.photos.length === 0 ? (
           <div className="flex-grow flex flex-col items-center justify-center cursor-pointer px-12 group" onClick={() => fileInputRef.current?.click()}>
-            <div className="w-full max-w-3xl aspect-[16/6] border border-white/5 flex flex-col items-center justify-center gap-6 relative">
+            <div className={`w-full max-w-3xl aspect-[16/6] border flex flex-col items-center justify-center gap-6 relative transition-all duration-500
+              ${isDragging ? 'border-[#d4c5a9] bg-[#d4c5a9]/5 scale-105' : 'border-white/5 group-hover:border-white/20'}
+            `}>
               <div className="text-center space-y-3 pointer-events-none">
                 <p className="text-xl tracking-[0.2em] text-white font-black uppercase">DROP PRODUCTION ASSETS</p>
                 <p className="text-[9px] text-white/20 uppercase tracking-widest">RAW • JPG • NEF • CR3</p>
@@ -507,13 +489,9 @@ export default function App() {
               </button>
             )}
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 2xl:grid-cols-8 gap-4">
-              {(expandedStackId ? activeProject.photos.filter(p => {
-                return true; // placeholder
-              }) : stackedPhotos).map((item: any) => (
+              {(expandedStackId ? activeProject.photos.filter(p => true) : stackedPhotos).map((item: any) => (
                 <PhotoCard 
-                  key={item.id} 
-                  photo={item} 
-                  stackCount={item._stack?.length}
+                  key={item.id} photo={item} stackCount={item._stack?.length}
                   onClick={item._stack ? () => setExpandedStackId(item.id) : undefined}
                   onToggle={(id) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id ? { ...p, selected: !p.selected } : p) } : null)} 
                   onRate={(id, rating) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id && p.analysis ? { ...p, selected: rating >= 3, analysis: { ...p.analysis, rating } } : p) } : null)} 
