@@ -1,0 +1,7 @@
+{
+  "name": "Novus Cura",
+  "description": "Tactical AI-powered photography culling and editing dashboard for high-volume event photographers.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
