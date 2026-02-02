@@ -8,7 +8,7 @@ import JSZip from 'jszip';
 import { PhotoMission, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
-const STORAGE_KEY = 'novus_cura_studio_v18_brute_force';
+const STORAGE_KEY = 'novus_cura_studio_v20_final';
 
 // --- Utility: Blob to Base64 (For AI Analysis) ---
 const blobToBase64 = (blob: Blob): Promise<string> => {
@@ -62,43 +62,80 @@ const generateXMP = (photo: PhotoMission): string => {
 <?xpacket end="w"?>`;
 };
 
-// --- Engine: Extract Metadata & Preview BLOB (BRUTE FORCE MODE) ---
+// --- Engine: The "Deep Search" Extraction (D850 Fix) ---
 const extractData = async (file: File): Promise<{ thumbnailBlob: Blob | null; meta: PhotoMetadata }> => {
   try {
-    // 1. Convert File to ArrayBuffer immediately to avoid stream errors
-    const arrayBuffer = await file.arrayBuffer();
+    // 1. Parse Metadata (Enable MakerNotes for Nikon)
+    let meta: PhotoMetadata = { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() };
+    
+    try {
+      // Read only the header/metadata chunks first to save memory
+      const exif = await exifr.parse(file, {
+        tiff: true,
+        ifd0: true,
+        exif: true,
+        makerNote: true, // CRITICAL for Nikon D850
+        xmp: false
+      });
 
-    // 2. Parse Metadata using the Buffer (More reliable for large files)
-    const exif = await exifr.parse(arrayBuffer, {
-      tiff: true,
-      ifd0: true,
-      ifd1: true,
-      exif: true,
-      xmp: false
-    });
+      meta = {
+        iso: exif?.ISO?.toString() || '100',
+        aperture: exif?.FNumber ? `f/${exif.FNumber}` : 'f/2.8',
+        shutter: exif?.ExposureTime ? `1/${Math.round(1/exif.ExposureTime)}` : '1/250',
+        timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
+      };
+    } catch (e) { console.warn("Metadata scan warning"); }
 
-    const meta: PhotoMetadata = {
-      iso: exif?.ISO?.toString() || '100',
-      aperture: exif?.FNumber ? `f/${exif.FNumber}` : 'f/2.8',
-      shutter: exif?.ExposureTime ? `1/${Math.round(1/exif.ExposureTime)}` : '1/250',
-      timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
-    };
-
-    // 3. The Brute Force Extraction Chain
+    // 2. Extraction Strategy
     let thumbnailBlob: Blob | null = null;
     let thumbBuffer: ArrayBuffer | undefined = undefined;
 
+    // Strategy A: Standard Preview (Works for Sony/Canon)
     try {
-      // PRIORITY 1: Large Preview (Found in Nikon SubIFDs)
-      // We explicitly pass the arrayBuffer to ensure it scans the whole memory
-      thumbBuffer = await exifr.preview(arrayBuffer);
-    } catch (e) { console.warn("Preview attempt 1 failed"); }
+      thumbBuffer = await exifr.preview(file);
+    } catch (e) { /* continue */ }
 
+    // Strategy B: Thumbnail (Works for some smaller RAWs)
     if (!thumbBuffer) {
       try {
-        // PRIORITY 2: Standard Thumbnail
-        thumbBuffer = await exifr.thumbnail(arrayBuffer);
-      } catch (e) { console.warn("Preview attempt 2 failed"); }
+        thumbBuffer = await exifr.thumbnail(file);
+      } catch (e) { /* continue */ }
+    }
+
+    // Strategy C: The "Manual Binary Scan" (Nikon D850 Fix)
+    // If library methods failed, we scan the file manually for the JPEG Header (FF D8)
+    if (!thumbBuffer) {
+      try {
+        // Read the first 20MB. D850 previews are usually at the start.
+        // If we read the whole file it might crash the browser on drop.
+        const CHUNK_SIZE = 20 * 1024 * 1024; 
+        const buffer = await file.slice(0, CHUNK_SIZE).arrayBuffer();
+        const view = new DataView(buffer);
+        
+        // Look for JPEG Start (FF D8)
+        let start = -1;
+        // Skip the first few bytes to avoid false positives in the TIFF header
+        for (let i = 1000; i < buffer.byteLength - 1; i++) {
+          if (view.getUint8(i) === 0xFF && view.getUint8(i+1) === 0xD8) {
+            // Found a JPEG start signature
+            // Check if it looks like a real image (followed by FF E1 or FF DB)
+            const nextMark = view.getUint8(i+2);
+            if (nextMark === 0xFF) {
+               start = i;
+               break; // Take the first valid JPEG found (usually the preview)
+            }
+          }
+        }
+
+        if (start !== -1) {
+          // Found it! Now we need to guess the end or just grab a chunk.
+          // Since we can't easily find the End Of Image (FF D9) without scanning everything,
+          // we will grab a generous 10MB chunk from this start point. 
+          // Browsers are good at rendering truncated JPEGs if the header is valid.
+          const end = Math.min(buffer.byteLength, start + 10 * 1024 * 1024);
+          thumbBuffer = buffer.slice(start, end);
+        }
+      } catch (e) { console.warn("Manual scan failed"); }
     }
 
     if (thumbBuffer) {
@@ -107,7 +144,7 @@ const extractData = async (file: File): Promise<{ thumbnailBlob: Blob | null; me
 
     return { thumbnailBlob, meta };
   } catch (err) {
-    console.warn(`Extraction Error (${file.name}):`, err);
+    console.error(`Extraction Critical Fail (${file.name}):`, err);
     return { 
       thumbnailBlob: null, 
       meta: { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() } 
@@ -266,7 +303,7 @@ const PhotoRow: React.FC<{
              </div>
            ) : photo.status === 'FAILED' ? (
              <span className="text-[9px] text-red-500/50 font-mono-data uppercase tracking-widest">
-               NO EMBEDDED PREVIEW (TRY SHOOTING RAW+JPG)
+               NO EMBEDDED PREVIEW FOUND (CHECK CAMERA SETTINGS)
              </span>
            ) : (
              <span className="text-[9px] text-white/10 font-mono-data uppercase tracking-widest">WAITING FOR INTELLIGENCE...</span>
@@ -324,6 +361,8 @@ export default function App() {
 
     const newPhotos: PhotoMission[] = [];
     for (const file of fileArray) {
+      // NOTE: We do NOT extract the Blob here to save memory in the main state
+      // We only extract Metadata for the UI list
       const { meta } = await extractData(file); 
       newPhotos.push({
         id: Math.random().toString(36).substr(2, 9),
@@ -448,4 +487,53 @@ export default function App() {
                 <p className="text-[9px] text-white/20 uppercase tracking-widest">RAW • JPG • NEF • CR3</p>
               </div>
             </div>
-            <input type="file" ref={fileInputRef}
+            <input type="file" ref={fileInputRef} multiple className="hidden" onChange={(e) => e.target.files && processFiles(e.target.files)} />
+          </div>
+        ) : (
+          <div className="animate-in fade-in duration-500 w-full">
+            <div className="flex items-center justify-between p-4 border-b border-white/10 text-[9px] font-mono-data text-white/30 uppercase tracking-[0.2em]">
+              <div className="flex items-center gap-6 flex-1">
+                <span className="w-8 text-center">STS</span>
+                <span className="w-48">FILENAME / META</span>
+                <span className="flex-1 px-4">INTELLIGENCE</span>
+              </div>
+              <span className="w-48 text-right">RATING</span>
+            </div>
+
+            <div className="flex flex-col">
+              {visiblePhotos.map((photo) => (
+                <PhotoRow 
+                  key={photo.id} photo={photo} 
+                  onToggle={(id) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id ? { ...p, selected: !p.selected } : p) } : null)} 
+                  onRate={(id, rating) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id && p.analysis ? { ...p, selected: rating >= 3, analysis: { ...p.analysis, rating } } : p) } : null)} 
+                />
+              ))}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {activeProject && activeProject.photos.length > 0 && !isProcessing && (
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-40 w-full max-w-2xl px-6">
+          <div className="bg-[#0a0a0a] border border-white/10 px-8 py-4 flex items-center justify-between rounded-full shadow-2xl">
+            <div className="flex items-center gap-8">
+              <button className="text-[10px] tracking-widest text-white/40 hover:text-white transition-all flex items-center gap-2 font-black uppercase">
+                <Save size={12} /> BACKUP
+              </button>
+              <div className="h-4 w-px bg-white/10"></div>
+              <div className="text-[10px] tracking-widest text-[#d4c5a9] font-black uppercase">{activeProject.photos.filter(p => p.selected).length} KEEPS</div>
+            </div>
+            <button 
+              onClick={handleExportXMP}
+              disabled={isExporting}
+              className="bg-white hover:bg-[#d4c5a9] text-black text-[10px] font-black tracking-widest uppercase px-8 py-2.5 rounded-full transition-all flex items-center gap-3 disabled:opacity-50"
+            >
+              {isExporting ? <Loader2 className="animate-spin" size={12} /> : 'EXPORT XMP'}
+              <ArrowRight size={14} />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
