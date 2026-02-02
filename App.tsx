@@ -1,14 +1,14 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
   ArrowRight, Loader2, Star, Save, FileCode, ArrowLeft, Edit2, Search, 
-  Layers, ChevronLeft, History, CheckCircle2, AlertCircle, FileImage
+  History, CheckCircle2, AlertCircle, FileImage
 } from 'lucide-react';
 import exifr from 'exifr';
 import JSZip from 'jszip';
-import { PhotoMission, PhotoAnalysis, PhotoMetadata, Project } from './types';
+import { PhotoMission, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
-const STORAGE_KEY = 'novus_cura_studio_v14';
+const STORAGE_KEY = 'novus_cura_studio_v16_final';
 
 // --- Utility: Blob to Base64 (For AI Analysis) ---
 const blobToBase64 = (blob: Blob): Promise<string> => {
@@ -17,7 +17,6 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
     reader.readAsDataURL(blob);
     reader.onload = () => {
       const result = reader.result as string;
-      // Remove the data:image/jpeg;base64, prefix
       const base64 = result.split(',')[1];
       resolve(base64);
     };
@@ -63,15 +62,16 @@ const generateXMP = (photo: PhotoMission): string => {
 <?xpacket end="w"?>`;
 };
 
-// --- Engine: Extract Metadata & Preview BLOB ---
-// We return the raw Blob here specifically for the AI to consume
+// --- Engine: Extract Metadata & Preview BLOB (AGGRESSIVE MODE) ---
 const extractData = async (file: File): Promise<{ thumbnailBlob: Blob | null; meta: PhotoMetadata }> => {
   try {
-    // 1. Parse Metadata
+    // 1. Parse Metadata (Lightweight)
+    // We disable 'tiff' here to speed up just reading the ISO/Shutter
     const exif = await exifr.parse(file, {
       tiff: true,
       ifd0: true,
       exif: true,
+      xmp: false // Skip XMP for speed, we only need basic EXIF
     });
 
     const meta: PhotoMetadata = {
@@ -81,20 +81,29 @@ const extractData = async (file: File): Promise<{ thumbnailBlob: Blob | null; me
       timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
     };
 
-    // 2. Extract Thumbnail Blob (Crucial for AI)
+    // 2. Extract Binary Image for AI (The Waterfall Method)
     let thumbnailBlob: Blob | null = null;
+    let thumbBuffer: ArrayBuffer | undefined = undefined;
+
     try {
-      // Attempt to get the embedded thumbnail binary data
-      const thumbBuffer = await exifr.thumbnail(file);
-      if (thumbBuffer) {
-        thumbnailBlob = new Blob([thumbBuffer], { type: 'image/jpeg' });
-      }
-    } catch (e) {
-      console.warn('No thumbnail found in RAW');
+      // PRIORITY 1: High-Res Preview (Nikon .NEF & Sony .ARW usually live here)
+      thumbBuffer = await exifr.preview(file);
+    } catch (e) { /* Continue to fallback */ }
+
+    if (!thumbBuffer) {
+      try {
+        // PRIORITY 2: Standard Thumbnail (Fuji .RAF & Canon often live here)
+        thumbBuffer = await exifr.thumbnail(file);
+      } catch (e) { /* Continue to fail state */ }
+    }
+
+    if (thumbBuffer) {
+      thumbnailBlob = new Blob([thumbBuffer], { type: 'image/jpeg' });
     }
 
     return { thumbnailBlob, meta };
   } catch (err) {
+    console.warn(`Extraction Error (${file.name}):`, err);
     return { 
       thumbnailBlob: null, 
       meta: { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() } 
@@ -204,7 +213,7 @@ const Header: React.FC<{
   );
 };
 
-// --- NEW LIST VIEW COMPONENT ---
+// --- LIST VIEW COMPONENT ---
 const PhotoRow: React.FC<{ 
   photo: PhotoMission; 
   onToggle: (id: string) => void; 
@@ -253,7 +262,7 @@ const PhotoRow: React.FC<{
              </div>
            ) : photo.status === 'FAILED' ? (
              <span className="text-[9px] text-red-500/50 font-mono-data uppercase tracking-widest">
-               PREVIEW EXTRACTION FAILED - RAW DATA UNREADABLE
+               NO EMBEDDED PREVIEW FOUND (CHECK CAMERA SETTINGS)
              </span>
            ) : (
              <span className="text-[9px] text-white/10 font-mono-data uppercase tracking-widest">WAITING FOR INTELLIGENCE...</span>
@@ -301,7 +310,6 @@ export default function App() {
     const fileArray = Array.from(files);
     if (fileArray.length === 0) return;
 
-    // Initialize Project
     let currentProject = activeProject || {
       id: Math.random().toString(36).substr(2, 9),
       name: `UNNAMED PRODUCTION`,
@@ -310,18 +318,14 @@ export default function App() {
       photos: []
     };
 
-    // 1. Ingest Stage (Get Metadata + Setup)
     const newPhotos: PhotoMission[] = [];
     for (const file of fileArray) {
-      // NOTE: We do NOT extract the Blob here to save memory in the main state
-      // We only extract Metadata for the UI list
       const { meta } = await extractData(file); 
-      
       newPhotos.push({
         id: Math.random().toString(36).substr(2, 9),
         name: file.name,
-        file, // Keep file reference for processing
-        previewUrl: null, // List view doesn't need URL
+        file, 
+        previewUrl: null, 
         status: 'PENDING',
         metadata: meta,
         selected: false
@@ -331,31 +335,22 @@ export default function App() {
     setActiveProject({ ...currentProject, photos: [...currentProject.photos, ...newPhotos] });
     setIsProcessing(true);
 
-    // 2. Intelligence Stage (Process One by One)
     for (let i = 0; i < newPhotos.length; i++) {
       const p = newPhotos[i];
       
-      // Update status to processing
       setActiveProject(prev => prev ? {
         ...prev,
         photos: prev.photos.map(item => item.id === p.id ? { ...item, status: 'PROCESSING' } : item)
       } : null);
 
       try {
-        // A. Extract ACTUAL Thumbnail Blob for AI
         const { thumbnailBlob } = await extractData(p.file!);
         
-        if (!thumbnailBlob) {
-           throw new Error("No preview found in RAW");
-        }
+        if (!thumbnailBlob) throw new Error("No preview found in RAW");
 
-        // B. Convert Thumbnail to Base64 (Small payload)
         const base64 = await blobToBase64(thumbnailBlob);
-
-        // C. Send to Gemini
         const analysis = await analyzePhoto(base64);
 
-        // D. Success
         setActiveProject(prev => prev ? {
           ...prev,
           photos: prev.photos.map(item => item.id === p.id ? { 
@@ -374,7 +369,6 @@ export default function App() {
         } : null);
       }
       
-      // Gentle throttle to be nice to the browser
       await new Promise(r => setTimeout(r, 500)); 
     }
     setIsProcessing(false);
@@ -435,7 +429,6 @@ export default function App() {
       />
 
       <main className="pt-20 pb-32 min-h-screen flex flex-col relative px-8 max-w-7xl mx-auto">
-        {/* Global Drag Overlay */}
         {isDragging && (
           <div className="absolute inset-0 z-50 bg-[#050505]/90 flex items-center justify-center backdrop-blur-sm border-2 border-[#d4c5a9] rounded-3xl animate-pulse pointer-events-none">
             <p className="text-2xl font-mono-data font-black text-[#d4c5a9] tracking-[0.5em] uppercase">RELEASE TO IMPORT</p>
@@ -455,7 +448,6 @@ export default function App() {
           </div>
         ) : (
           <div className="animate-in fade-in duration-500 w-full">
-            {/* Table Header */}
             <div className="flex items-center justify-between p-4 border-b border-white/10 text-[9px] font-mono-data text-white/30 uppercase tracking-[0.2em]">
               <div className="flex items-center gap-6 flex-1">
                 <span className="w-8 text-center">STS</span>
@@ -465,12 +457,10 @@ export default function App() {
               <span className="w-48 text-right">RATING</span>
             </div>
 
-            {/* List View */}
             <div className="flex flex-col">
               {visiblePhotos.map((photo) => (
                 <PhotoRow 
-                  key={photo.id} 
-                  photo={photo} 
+                  key={photo.id} photo={photo} 
                   onToggle={(id) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id ? { ...p, selected: !p.selected } : p) } : null)} 
                   onRate={(id, rating) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id && p.analysis ? { ...p, selected: rating >= 3, analysis: { ...p.analysis, rating } } : p) } : null)} 
                 />
