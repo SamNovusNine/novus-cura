@@ -1,49 +1,39 @@
 import { GoogleGenAI, SchemaType, Type } from "@google/genai";
 import { PhotoAnalysis } from "../types";
 
-// Strict JSON schema to force the AI to behave like a database
+// Strict Schema: Forces AI to return numbers, avoiding parsing errors
 const analysisSchema = {
   type: Type.OBJECT,
   properties: {
     rating: {
       type: Type.INTEGER,
-      description: "Star rating from 0 to 5. 5: Hero shot. 4: Great. 3: Good. 2: Duplicate. 1: Poor. 0: Reject.",
+      description: "Star rating from 0 to 5. 5=Hero, 4=Great, 3=Good, 0=Reject.",
     },
     exposure: {
       type: Type.NUMBER,
-      description: "Lightroom Exposure EV offset (e.g., -0.5, 0.3).",
+      description: "Exposure offset (e.g. -0.5, 0.3).",
     },
-    temp: {
-      type: Type.NUMBER,
-      description: "White Balance Temp offset (e.g., 200, -400).",
-    },
+    temp: { type: Type.NUMBER },
     highlights: { type: Type.NUMBER },
     shadows: { type: Type.NUMBER },
     whites: { type: Type.NUMBER },
     blacks: { type: Type.NUMBER },
     contrast: { type: Type.NUMBER },
-    reason: {
-      type: Type.STRING,
-      description: "Short aesthetic reasoning.",
-    },
+    reason: { type: Type.STRING },
     keywords: {
       type: Type.ARRAY,
       items: { type: Type.STRING },
-      description: "Descriptive keywords for search (e.g., 'bride', 'bokeh', 'sunset').",
     },
-    caption: {
-      type: Type.STRING,
-      description: "A short, descriptive aesthetic summary.",
-    }
+    caption: { type: Type.STRING }
   },
-  required: ["rating", "exposure", "temp", "highlights", "shadows", "whites", "blacks", "contrast", "reason", "keywords", "caption"],
+  required: ["rating", "exposure", "temp", "reason", "keywords", "caption"],
 };
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const analyzePhoto = async (base64Image: string, attempt: number = 1): Promise<PhotoAnalysis> => {
   const MAX_ATTEMPTS = 3;
-  // Use the correct stable model name
+  // FIXED: Use the correct stable model name
   const MODEL_NAME = 'gemini-1.5-flash';
 
   try {
@@ -54,7 +44,7 @@ export const analyzePhoto = async (base64Image: string, attempt: number = 1): Pr
         {
           parts: [
             { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
-            { text: "Act as a high-end commercial photo editor. Analyze this image aesthetically.\n\nSTRICT CULLING:\n- 0 STARS for out-of-focus, blurry, or rubbish shots.\n- 5 STARS for incredible composition and emotion.\n- Preserve MOOD: If moody/low-key, keep it dark.\n\nMETADATA:\nProvide descriptive keywords and a short caption." }
+            { text: "Analyze this event photo. Rating 0-5. If blurry/bad focus: 0. If sharp/emotional: 5. Return JSON." }
           ]
         }
       ],
@@ -66,10 +56,9 @@ export const analyzePhoto = async (base64Image: string, attempt: number = 1): Pr
 
     const text = response.text || "{}";
     const result = JSON.parse(text);
-    
-    // Ensure we always return at least a default object if AI misses fields
+
     return {
-      rating: result.rating ?? 3, // Default to 3 stars if unsure
+      rating: result.rating ?? 0,
       exposure: result.exposure ?? 0,
       temp: result.temp ?? 0,
       highlights: result.highlights ?? 0,
@@ -77,24 +66,22 @@ export const analyzePhoto = async (base64Image: string, attempt: number = 1): Pr
       whites: result.whites ?? 0,
       blacks: result.blacks ?? 0,
       contrast: result.contrast ?? 0,
-      reason: result.reason ?? "AI_ANALYSIS_COMPLETE",
+      reason: result.reason ?? "Processed",
       keywords: result.keywords ?? [],
-      caption: result.caption ?? "Processed by Novus Cura"
+      caption: result.caption ?? ""
     };
 
   } catch (error: any) {
     console.error("Gemini API Error:", error);
     
-    const isRateLimit = error?.status === 429 || error?.message?.includes('429');
-
-    if (isRateLimit && attempt < MAX_ATTEMPTS) {
-      const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
-      console.warn(`Rate limit hit. Retrying in ${Math.round(delay)}ms...`);
+    // Retry logic for rate limits
+    if ((error?.status === 429 || error?.message?.includes('429')) && attempt < MAX_ATTEMPTS) {
+      const delay = Math.pow(2, attempt) * 1000;
       await wait(delay);
       return analyzePhoto(base64Image, attempt + 1);
     }
 
-    // Fallback if AI fails completely
+    // Fail gracefully
     return {
       rating: 0,
       exposure: 0,
@@ -104,9 +91,9 @@ export const analyzePhoto = async (base64Image: string, attempt: number = 1): Pr
       whites: 0,
       blacks: 0,
       contrast: 0,
-      reason: "API_FAILURE",
-      keywords: ["error"],
-      caption: "Analysis failed due to network or API limit."
+      reason: "API_FAIL",
+      keywords: [],
+      caption: "Analysis failed."
     };
   }
 };
