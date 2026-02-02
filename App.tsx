@@ -1,21 +1,24 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
-  ArrowRight, Loader2, Star, Save, FileCode, ArrowLeft, Edit2, Search, Layers, ChevronLeft, History
+  ArrowRight, Loader2, Star, Save, FileCode, ArrowLeft, Edit2, Search, 
+  Layers, ChevronLeft, History, CheckCircle2, AlertCircle, FileImage
 } from 'lucide-react';
 import exifr from 'exifr';
 import JSZip from 'jszip';
-import { PhotoMission, PhotoMetadata, Project } from './types';
+import { PhotoMission, PhotoAnalysis, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
-const STORAGE_KEY = 'novus_cura_studio_v13';
+const STORAGE_KEY = 'novus_cura_studio_v14';
 
-// --- Utility: File to Base64 ---
-const fileToBase64 = (file: File): Promise<string> => {
+// --- Utility: Blob to Base64 (For AI Analysis) ---
+const blobToBase64 = (blob: Blob): Promise<string> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(blob);
     reader.onload = () => {
-      const base64 = (reader.result as string).split(',')[1];
+      const result = reader.result as string;
+      // Remove the data:image/jpeg;base64, prefix
+      const base64 = result.split(',')[1];
       resolve(base64);
     };
     reader.onerror = (error) => reject(error);
@@ -60,10 +63,11 @@ const generateXMP = (photo: PhotoMission): string => {
 <?xpacket end="w"?>`;
 };
 
-// --- Engine: Extract RAW Preview & Metadata ---
-const extractMetadata = async (file: File): Promise<{ url: string | null; meta: PhotoMetadata }> => {
+// --- Engine: Extract Metadata & Preview BLOB ---
+// We return the raw Blob here specifically for the AI to consume
+const extractData = async (file: File): Promise<{ thumbnailBlob: Blob | null; meta: PhotoMetadata }> => {
   try {
-    // 1. Get Metadata (Fast)
+    // 1. Parse Metadata
     const exif = await exifr.parse(file, {
       tiff: true,
       ifd0: true,
@@ -77,35 +81,23 @@ const extractMetadata = async (file: File): Promise<{ url: string | null; meta: 
       timestamp: exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal).getTime() : Date.now()
     };
 
-    // 2. Aggressive Preview Extraction
-    let previewUrl: string | null = null;
-    
-    // Attempt A: Standard Thumbnail
+    // 2. Extract Thumbnail Blob (Crucial for AI)
+    let thumbnailBlob: Blob | null = null;
     try {
-      previewUrl = await exifr.thumbnailUrl(file);
-    } catch (e) { /* continue */ }
-
-    // Attempt B: Deep Preview (Better for NEF/CR3)
-    if (!previewUrl) {
-      try {
-        const previewBuffer = await exifr.preview(file);
-        if (previewBuffer) {
-           previewUrl = URL.createObjectURL(new Blob([previewBuffer]));
-        }
-      } catch (e) { /* continue */ }
+      // Attempt to get the embedded thumbnail binary data
+      const thumbBuffer = await exifr.thumbnail(file);
+      if (thumbBuffer) {
+        thumbnailBlob = new Blob([thumbBuffer], { type: 'image/jpeg' });
+      }
+    } catch (e) {
+      console.warn('No thumbnail found in RAW');
     }
 
-    // Attempt C: Fallback for web images
-    if (!previewUrl && (file.type.startsWith('image/') || /\.(jpg|png|webp)$/i.test(file.name))) {
-      previewUrl = URL.createObjectURL(file);
-    }
-    
-    return { url: previewUrl || null, meta };
+    return { thumbnailBlob, meta };
   } catch (err) {
-    console.warn(`Metadata extraction failed for ${file.name}:`, err);
     return { 
-      url: null, 
-      meta: { iso: '100', aperture: 'f/2.8', shutter: '1/250', timestamp: Date.now() } 
+      thumbnailBlob: null, 
+      meta: { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() } 
     };
   }
 };
@@ -122,10 +114,10 @@ const StarRating: React.FC<{
           key={star}
           disabled={!interactive}
           onClick={(e) => { e.stopPropagation(); onRate(star); }}
-          className={`transition-all ${interactive ? 'hover:scale-125' : 'cursor-default'}`}
+          className={`transition-all ${interactive ? 'hover:scale-110' : 'cursor-default'}`}
         >
           <Star 
-            size={12} 
+            size={14} 
             className={`${star <= rating ? 'fill-[#d4c5a9] text-[#d4c5a9]' : 'text-white/10'}`} 
             strokeWidth={star <= rating ? 0 : 2}
           />
@@ -134,9 +126,9 @@ const StarRating: React.FC<{
       {interactive && (
         <button
           onClick={(e) => { e.stopPropagation(); onRate(0); }}
-          className="ml-2 text-[8px] font-mono-data text-white/30 uppercase tracking-widest font-black hover:text-white transition-colors"
+          className="ml-3 text-[9px] font-mono-data text-white/20 uppercase tracking-widest font-black hover:text-white transition-colors"
         >
-          CL
+          CLEAR
         </button>
       )}
     </div>
@@ -212,63 +204,68 @@ const Header: React.FC<{
   );
 };
 
-const PhotoCard: React.FC<{ 
-  photo: PhotoMission; onToggle: (id: string) => void; 
-  onRate: (id: string, rating: number) => void; stackCount?: number; onClick?: () => void;
-}> = ({ photo, onToggle, onRate, stackCount, onClick }) => {
+// --- NEW LIST VIEW COMPONENT ---
+const PhotoRow: React.FC<{ 
+  photo: PhotoMission; 
+  onToggle: (id: string) => void; 
+  onRate: (id: string, rating: number) => void; 
+}> = ({ photo, onToggle, onRate }) => {
   const isSelected = photo.selected;
-  const [imgError, setImgError] = useState(false);
-
+  
   return (
     <div 
-      onClick={() => onClick ? onClick() : onToggle(photo.id)}
-      className={`group relative aspect-[3/4] bg-[#0a0a0a] overflow-hidden cursor-pointer transition-all duration-500 border ${isSelected ? 'border-[#d4c5a9]' : 'border-white/5 hover:border-white/20'}`}
+      onClick={() => onToggle(photo.id)}
+      className={`group flex items-center justify-between p-4 border-b transition-all cursor-pointer
+        ${isSelected ? 'bg-[#d4c5a9]/5 border-[#d4c5a9]/30' : 'bg-transparent border-white/5 hover:bg-white/[0.02]'}
+      `}
     >
-      {photo.previewUrl && !imgError ? (
-        <img 
-          src={photo.previewUrl} alt={photo.name} onError={() => setImgError(true)}
-          className={`w-full h-full object-cover transition-all duration-700 ${isSelected ? 'brightness-110' : 'brightness-50 group-hover:brightness-90'}`}
-        />
-      ) : (
-        <div className="w-full h-full bg-[#1a1a1a] flex flex-col items-center justify-center gap-3">
-          <FileCode size={24} className="text-white/20" />
-          <p className="text-[8px] font-mono-data text-white/30 uppercase font-black">
-            {photo.name.length > 20 ? photo.name.substring(0, 15) + '...' : photo.name}
-          </p>
-          <p className="text-[7px] font-mono-data text-[#d4c5a9]/50 uppercase tracking-widest">
-            {imgError ? 'PREVIEW ERROR' : 'NO PREVIEW'}
-          </p>
+      <div className="flex items-center gap-6 flex-1">
+        {/* Status Icon */}
+        <div className="w-8 flex justify-center">
+          {photo.status === 'PENDING' && <div className="w-2 h-2 bg-white/20 rounded-full" />}
+          {photo.status === 'PROCESSING' && <Loader2 size={16} className="text-[#d4c5a9] animate-spin" />}
+          {photo.status === 'COMPLETED' && <CheckCircle2 size={16} className="text-[#d4c5a9]" />}
+          {photo.status === 'FAILED' && <AlertCircle size={16} className="text-red-500" />}
         </div>
-      )}
 
-      {stackCount && stackCount > 1 && (
-        <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5 bg-black/60 backdrop-blur-md px-2 py-1 rounded-full border border-white/10">
-          <Layers size={10} className="text-[#d4c5a9]" />
-          <span className="text-[8px] font-mono-data font-black text-white">{stackCount}</span>
+        {/* File Info */}
+        <div className="flex flex-col w-48">
+          <span className={`text-[11px] font-mono-data font-bold tracking-wider ${isSelected ? 'text-white' : 'text-white/60'}`}>
+            {photo.name}
+          </span>
+          <span className="text-[9px] font-mono-data text-white/30 uppercase">
+            {photo.metadata?.iso !== '-' ? `ISO ${photo.metadata?.iso} • ${photo.metadata?.shutter} • ${photo.metadata?.aperture}` : 'RAW DATA'}
+          </span>
         </div>
-      )}
 
-      {isSelected && (
-        <div className="absolute top-3 right-3 z-20">
-          <div className="w-2.5 h-2.5 rounded-full bg-[#d4c5a9] shadow-[0_0_15px_rgba(212,197,169,0.5)]" />
+        {/* AI Analysis / Caption */}
+        <div className="flex-1 px-4">
+           {photo.status === 'COMPLETED' ? (
+             <div className="flex flex-col gap-1">
+               <span className="text-[10px] text-white/80 font-mono-data uppercase tracking-wide">
+                 {photo.analysis?.reason || photo.analysis?.caption || 'ANALYZED'}
+               </span>
+               {photo.analysis?.keywords && photo.analysis.keywords.length > 0 && (
+                 <span className="text-[8px] text-white/30 font-mono-data uppercase tracking-widest">
+                   {photo.analysis.keywords.slice(0, 3).join(' / ')}
+                 </span>
+               )}
+             </div>
+           ) : photo.status === 'FAILED' ? (
+             <span className="text-[9px] text-red-500/50 font-mono-data uppercase tracking-widest">
+               PREVIEW EXTRACTION FAILED - RAW DATA UNREADABLE
+             </span>
+           ) : (
+             <span className="text-[9px] text-white/10 font-mono-data uppercase tracking-widest">WAITING FOR INTELLIGENCE...</span>
+           )}
         </div>
-      )}
+      </div>
 
-      <div className="absolute inset-0 bg-gradient-to-t from-black via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-5">
-        <div className="space-y-3">
-          <div className="space-y-0.5">
-            <p className="text-[10px] font-mono-data text-white font-black tracking-widest uppercase truncate">{photo.name}</p>
-            <p className="text-[8px] font-mono-data text-white/40 tracking-widest uppercase font-bold">
-              {photo.metadata?.shutter} • {photo.metadata?.aperture} • ISO {photo.metadata?.iso}
-            </p>
-          </div>
-          {photo.status === 'COMPLETED' && (
-            <div className="pt-2 border-t border-white/10 space-y-2">
-              <StarRating rating={photo.analysis?.rating || 0} onRate={(r) => onRate(photo.id, r)} interactive />
-              <p className="text-[7px] text-white/30 font-black uppercase tracking-widest line-clamp-2">{photo.analysis?.caption}</p>
-            </div>
-          )}
-        </div>
+      {/* Ratings */}
+      <div className="w-48 flex justify-end">
+        {photo.status === 'COMPLETED' && (
+          <StarRating rating={photo.analysis?.rating || 0} onRate={(r) => onRate(photo.id, r)} interactive />
+        )}
       </div>
     </div>
   );
@@ -277,12 +274,9 @@ const PhotoCard: React.FC<{
 export default function App() {
   const [activeProject, setActiveProject] = useState<Project | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [isProcessingView, setIsProcessingView] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [processedCount, setProcessedCount] = useState(0);
-  const [showHistory, setShowHistory] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [expandedStackId, setExpandedStackId] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -307,9 +301,7 @@ export default function App() {
     const fileArray = Array.from(files);
     if (fileArray.length === 0) return;
 
-    setIsProcessingView(true);
-    setProcessedCount(0);
-    
+    // Initialize Project
     let currentProject = activeProject || {
       id: Math.random().toString(36).substr(2, 9),
       name: `UNNAMED PRODUCTION`,
@@ -318,14 +310,18 @@ export default function App() {
       photos: []
     };
 
+    // 1. Ingest Stage (Get Metadata + Setup)
     const newPhotos: PhotoMission[] = [];
     for (const file of fileArray) {
-      const { url, meta } = await extractMetadata(file);
+      // NOTE: We do NOT extract the Blob here to save memory in the main state
+      // We only extract Metadata for the UI list
+      const { meta } = await extractData(file); 
+      
       newPhotos.push({
         id: Math.random().toString(36).substr(2, 9),
         name: file.name,
-        file,
-        previewUrl: url,
+        file, // Keep file reference for processing
+        previewUrl: null, // List view doesn't need URL
         status: 'PENDING',
         metadata: meta,
         selected: false
@@ -333,14 +329,33 @@ export default function App() {
     }
 
     setActiveProject({ ...currentProject, photos: [...currentProject.photos, ...newPhotos] });
+    setIsProcessing(true);
 
+    // 2. Intelligence Stage (Process One by One)
     for (let i = 0; i < newPhotos.length; i++) {
       const p = newPhotos[i];
-      if (i > 0) await new Promise(r => setTimeout(r, 1000));
+      
+      // Update status to processing
+      setActiveProject(prev => prev ? {
+        ...prev,
+        photos: prev.photos.map(item => item.id === p.id ? { ...item, status: 'PROCESSING' } : item)
+      } : null);
 
       try {
-        const base64 = await fileToBase64(p.file!);
+        // A. Extract ACTUAL Thumbnail Blob for AI
+        const { thumbnailBlob } = await extractData(p.file!);
+        
+        if (!thumbnailBlob) {
+           throw new Error("No preview found in RAW");
+        }
+
+        // B. Convert Thumbnail to Base64 (Small payload)
+        const base64 = await blobToBase64(thumbnailBlob);
+
+        // C. Send to Gemini
         const analysis = await analyzePhoto(base64);
+
+        // D. Success
         setActiveProject(prev => prev ? {
           ...prev,
           photos: prev.photos.map(item => item.id === p.id ? { 
@@ -350,43 +365,32 @@ export default function App() {
             selected: (analysis.rating || 0) >= 3 
           } : item)
         } : null);
+
       } catch (err) {
+        console.error("Processing failed for", p.name, err);
         setActiveProject(prev => prev ? {
           ...prev,
           photos: prev.photos.map(item => item.id === p.id ? { ...item, status: 'FAILED' } : item)
         } : null);
       }
-      setProcessedCount(i + 1);
+      
+      // Gentle throttle to be nice to the browser
+      await new Promise(r => setTimeout(r, 500)); 
     }
-    setTimeout(() => setIsProcessingView(false), 500);
+    setIsProcessing(false);
   };
 
-  // --- FIXED DRAG & DROP ---
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(true);
+  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); };
+  const handleDragLeave = (e: React.DragEvent) => { 
+    e.preventDefault(); e.stopPropagation(); 
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) setIsDragging(false); 
   };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    // Only turn off if we left the *window* or the main container, not child elements
-    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-      setIsDragging(false);
-    }
-  };
-
   const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      processFiles(e.dataTransfer.files);
-    }
+    e.preventDefault(); e.stopPropagation(); setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) processFiles(e.dataTransfer.files);
   };
 
-  const filteredPhotos = useMemo(() => {
+  const visiblePhotos = useMemo(() => {
     if (!activeProject) return [];
     if (!searchQuery.trim()) return activeProject.photos;
     const query = searchQuery.toLowerCase().trim();
@@ -396,26 +400,6 @@ export default function App() {
       p.analysis?.caption.toLowerCase().includes(query)
     );
   }, [activeProject, searchQuery]);
-
-  const stackedPhotos = useMemo(() => {
-    if (searchQuery.trim() || expandedStackId) return filteredPhotos;
-    const stacks: PhotoMission[][] = [];
-    const sorted = [...filteredPhotos].sort((a, b) => (a.metadata?.timestamp || 0) - (b.metadata?.timestamp || 0));
-    sorted.forEach(p => {
-      const lastStack = stacks[stacks.length - 1];
-      if (lastStack && p.metadata?.timestamp && lastStack[0].metadata?.timestamp && 
-          p.metadata.timestamp - lastStack[lastStack.length - 1].metadata!.timestamp! <= 1000) {
-        lastStack.push(p);
-      } else {
-        stacks.push([p]);
-      }
-    });
-    return stacks.map(stack => {
-      if (stack.length === 1) return stack[0];
-      const best = [...stack].sort((a, b) => (b.analysis?.rating || 0) - (a.analysis?.rating || 0))[0];
-      return { ...best, _stack: stack }; 
-    });
-  }, [filteredPhotos, searchQuery, expandedStackId]);
 
   const handleExportXMP = async () => {
     if (!activeProject) return;
@@ -438,44 +422,31 @@ export default function App() {
   return (
     <div 
       className="min-h-screen bg-[#050505] text-white selection:bg-[#d4c5a9] selection:text-black font-mono-data"
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
+      onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
     >
       <Header 
         count={activeProject?.photos.filter(p => p.selected).length || 0} 
         total={activeProject?.photos.length || 0} 
         projectName={activeProject?.name} 
         onRename={(name) => activeProject && setActiveProject({...activeProject, name})}
-        onBack={() => expandedStackId ? setExpandedStackId(null) : setActiveProject(null)} 
-        onShowHistory={() => setShowHistory(true)}
+        onBack={() => setActiveProject(null)} 
+        onShowHistory={() => {}}
         searchQuery={searchQuery} onSearch={setSearchQuery}
       />
 
-      <main className="pt-16 pb-32 min-h-screen flex flex-col relative">
-        {/* Global Drag Overlay (Fixed Glitch) */}
+      <main className="pt-20 pb-32 min-h-screen flex flex-col relative px-8 max-w-7xl mx-auto">
+        {/* Global Drag Overlay */}
         {isDragging && (
-          <div className="absolute inset-0 z-50 bg-[#050505]/90 flex items-center justify-center backdrop-blur-sm border-2 border-[#d4c5a9] m-4 rounded-3xl animate-pulse pointer-events-none">
-            <p className="text-2xl font-mono-data font-black text-[#d4c5a9] tracking-[0.5em] uppercase">
-              RELEASE TO IMPORT
-            </p>
+          <div className="absolute inset-0 z-50 bg-[#050505]/90 flex items-center justify-center backdrop-blur-sm border-2 border-[#d4c5a9] rounded-3xl animate-pulse pointer-events-none">
+            <p className="text-2xl font-mono-data font-black text-[#d4c5a9] tracking-[0.5em] uppercase">RELEASE TO IMPORT</p>
           </div>
         )}
 
-        {isProcessingView ? (
-          <div className="flex-grow flex flex-col items-center justify-center animate-in fade-in duration-500">
-            <div className="text-center space-y-8">
-              <p className="text-[10px] tracking-[0.3em] text-[#d4c5a9] uppercase font-black">AI TONAL SCANNING...</p>
-              <div className="w-64 h-[1px] bg-white/5 mx-auto relative overflow-hidden">
-                <div className="absolute inset-y-0 left-0 bg-[#d4951f] transition-all duration-300" style={{ width: `${(processedCount / (activeProject?.photos.length || 1)) * 100}%` }} />
-              </div>
-              <p className="text-[9px] tracking-widest text-white/30 uppercase font-black">{Math.round((processedCount / (activeProject?.photos.length || 1)) * 100)}%</p>
-            </div>
-          </div>
-        ) : !activeProject || activeProject.photos.length === 0 ? (
-          <div className="flex-grow flex flex-col items-center justify-center cursor-pointer px-12 group" onClick={() => fileInputRef.current?.click()}>
-            <div className={`w-full max-w-3xl aspect-[16/6] border flex flex-col items-center justify-center gap-6 relative transition-all duration-500 border-white/5 group-hover:border-white/20`}>
+        {!activeProject || activeProject.photos.length === 0 ? (
+          <div className="flex-grow flex flex-col items-center justify-center cursor-pointer group" onClick={() => fileInputRef.current?.click()}>
+            <div className={`w-full max-w-2xl aspect-[16/6] border flex flex-col items-center justify-center gap-6 relative transition-all duration-500 border-white/5 group-hover:border-white/20 bg-white/[0.01]`}>
               <div className="text-center space-y-3 pointer-events-none">
+                <FileImage size={32} className="text-[#d4c5a9] mx-auto mb-4" />
                 <p className="text-xl tracking-[0.2em] text-white font-black uppercase">DROP PRODUCTION ASSETS</p>
                 <p className="text-[9px] text-white/20 uppercase tracking-widest">RAW • JPG • NEF • CR3</p>
               </div>
@@ -483,17 +454,23 @@ export default function App() {
             <input type="file" ref={fileInputRef} multiple className="hidden" onChange={(e) => e.target.files && processFiles(e.target.files)} />
           </div>
         ) : (
-          <div className="px-8 animate-in fade-in duration-500">
-            {expandedStackId && (
-              <button onClick={() => setExpandedStackId(null)} className="mb-8 flex items-center gap-2 text-[10px] text-[#d4c5a9] uppercase font-black hover:text-white transition-all">
-                <ChevronLeft size={16} /> BACK TO PRODUCTIONS
-              </button>
-            )}
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 2xl:grid-cols-8 gap-4">
-              {(expandedStackId ? activeProject.photos.filter(p => true) : stackedPhotos).map((item: any) => (
-                <PhotoCard 
-                  key={item.id} photo={item} stackCount={item._stack?.length}
-                  onClick={item._stack ? () => setExpandedStackId(item.id) : undefined}
+          <div className="animate-in fade-in duration-500 w-full">
+            {/* Table Header */}
+            <div className="flex items-center justify-between p-4 border-b border-white/10 text-[9px] font-mono-data text-white/30 uppercase tracking-[0.2em]">
+              <div className="flex items-center gap-6 flex-1">
+                <span className="w-8 text-center">STS</span>
+                <span className="w-48">FILENAME / META</span>
+                <span className="flex-1 px-4">INTELLIGENCE</span>
+              </div>
+              <span className="w-48 text-right">RATING</span>
+            </div>
+
+            {/* List View */}
+            <div className="flex flex-col">
+              {visiblePhotos.map((photo) => (
+                <PhotoRow 
+                  key={photo.id} 
+                  photo={photo} 
                   onToggle={(id) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id ? { ...p, selected: !p.selected } : p) } : null)} 
                   onRate={(id, rating) => setActiveProject(prev => prev ? { ...prev, photos: prev.photos.map(p => p.id === id && p.analysis ? { ...p, selected: rating >= 3, analysis: { ...p.analysis, rating } } : p) } : null)} 
                 />
@@ -503,7 +480,7 @@ export default function App() {
         )}
       </main>
 
-      {activeProject && activeProject.photos.length > 0 && !isProcessingView && (
+      {activeProject && activeProject.photos.length > 0 && !isProcessing && (
         <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-40 w-full max-w-2xl px-6">
           <div className="bg-[#0a0a0a] border border-white/10 px-8 py-4 flex items-center justify-between rounded-full shadow-2xl">
             <div className="flex items-center gap-8">
