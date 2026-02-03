@@ -17,17 +17,7 @@ export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> 
     };
   }
 
-  // 2. SAFETY: Disable filters so it doesn't block "people"
-  const safetySettings = [
-    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-  ];
-
-  const genAI = new GoogleGenerativeAI(apiKey);
-
-  // 3. MODEL LIST: The "Self-Healing" Order
+  // 2. MODEL LIST: The "Self-Healing" Order
   // We try 'gemini-pro' FIRST because it is the most widely available.
   const MODELS_TO_TRY = [
     "gemini-1.5-flash",        // Fast, new
@@ -36,7 +26,17 @@ export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> 
     "gemini-pro",              // Old faithful (Legacy v1.0)
     "gemini-1.0-pro"           // Explicit Legacy
   ];
+
+  const genAI = new GoogleGenerativeAI(apiKey);
   
+  // 3. SAFETY: Disable filters so it doesn't block "people"
+  const safetySettings = [
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+  ];
+
   // 4. THE PROMPT
   const prompt = `
     Act as a professional photo editor. Analyze this image.
