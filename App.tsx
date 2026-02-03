@@ -8,7 +8,7 @@ import JSZip from 'jszip';
 import { PhotoMission, PhotoMetadata, Project } from './types';
 import { analyzePhoto } from './services/geminiService';
 
-const STORAGE_KEY = 'novus_cura_final_v4';
+const STORAGE_KEY = 'novus_cura_final_production';
 
 // --- ENGINE: Sanitizer (Fixes Rotation & Compresses) ---
 const sanitizeAndCompress = (blob: Blob, orientation: number = 1): Promise<string> => {
@@ -52,7 +52,7 @@ const sanitizeAndCompress = (blob: Blob, orientation: number = 1): Promise<strin
   });
 };
 
-// --- ENGINE: Deep Extractor (Finds Nikon Previews) ---
+// --- ENGINE: Extractor ---
 const extractMetadata = async (file: File): Promise<{ url: string | null; meta: PhotoMetadata; blob: Blob | null; orientation: number }> => {
   try {
     let meta: PhotoMetadata = { iso: '-', aperture: '-', shutter: '-', timestamp: Date.now() };
@@ -126,10 +126,10 @@ const Header: React.FC<{ count: number; total: number; projectName?: string; onB
   </header>
 );
 
-const PhotoCard: React.FC<{ photo: PhotoMission; onToggle: (id: string) => void; onRate: (id: string, rating: number) => void; stackCount?: number; onClick?: () => void; }> = ({ photo, onToggle, onRate, stackCount, onClick }) => {
+const PhotoCard: React.FC<{ photo: PhotoMission; onToggle: (id: string) => void; onRate: (id: string, rating: number) => void; }> = ({ photo, onToggle, onRate }) => {
   const isSelected = photo.selected;
   return (
-    <div onClick={() => onClick ? onClick() : onToggle(photo.id)} className={`group relative aspect-[3/4] bg-[#0a0a0a] overflow-hidden cursor-pointer transition-all duration-500 border ${isSelected ? 'border-[#d4c5a9]' : 'border-white/5 hover:border-white/20'}`}>
+    <div onClick={() => onToggle(photo.id)} className={`group relative aspect-[3/4] bg-[#0a0a0a] overflow-hidden cursor-pointer transition-all duration-500 border ${isSelected ? 'border-[#d4c5a9]' : 'border-white/5 hover:border-white/20'}`}>
       {photo.previewUrl ? (
         <>
           <img src={photo.previewUrl} alt={photo.name} className={`w-full h-full object-cover transition-all duration-700 ${isSelected ? 'brightness-110' : 'brightness-50 group-hover:brightness-90'} ${photo.status === 'FAILED' ? 'opacity-30' : 'opacity-100'}`} />
