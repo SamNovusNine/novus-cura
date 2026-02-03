@@ -1,7 +1,6 @@
 import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from "@google/generative-ai";
 import { PhotoAnalysis } from "../types";
 
-// 1. HELPER: Clean JSON
 const cleanJSON = (text: string): string => {
   return text.replace(/^```json\s*/, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
 };
@@ -17,19 +16,17 @@ export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> 
     };
   }
 
-  // 2. THE EXPANDED MODEL LIST (Includes Legacy Fallbacks)
+  // FORCE LEGACY MODEL FIRST
+  // This is the specific fix for your "404 Model Not Found" error
   const MODELS_TO_TRY = [
+    "gemini-pro",        // <--- MOVED TO TOP (The "Toyota Corolla" model that works everywhere)
     "gemini-1.5-flash",
-    "gemini-1.5-flash-001",
     "gemini-1.5-pro",
-    "gemini-pro",        // <-- The "Old Faithful" (Most likely to work)
-    "gemini-1.0-pro",    // <-- Explicit Legacy
-    "gemini-pro-vision"  // <-- Older vision specific model
+    "gemini-1.0-pro"
   ];
 
   const genAI = new GoogleGenerativeAI(apiKey);
   
-  // 3. SAFETY: Uncensored
   const safetySettings = [
     { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
     { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -55,25 +52,18 @@ export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> 
     }
   `;
 
-  // 4. LOOP
   for (const modelName of MODELS_TO_TRY) {
     try {
       console.log(`🤖 Trying Model: ${modelName}...`);
-      
       const model = genAI.getGenerativeModel({ model: modelName, safetySettings });
-
       const result = await model.generateContent([
         prompt,
         { inlineData: { data: base64Image, mimeType: "image/jpeg" } }
       ]);
-
       const response = await result.response;
       const text = response.text();
-      
-      // If we get here, it worked!
-      console.log(`✅ SUCCESS with ${modelName}`);
       const data = JSON.parse(cleanJSON(text));
-      
+      console.log(`✅ SUCCESS with ${modelName}`);
       return {
         rating: typeof data.rating === 'number' ? data.rating : 0,
         exposure: data.exposure || 0,
@@ -87,24 +77,16 @@ export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> 
         keywords: Array.isArray(data.keywords) ? data.keywords : [],
         caption: data.caption || ""
       };
-
     } catch (error: any) {
       console.warn(`⚠️ Failed with ${modelName}:`, error.message);
-      
-      // If this was the last model, return failure
       if (modelName === MODELS_TO_TRY[MODELS_TO_TRY.length - 1]) {
-        let failReason = "ALL MODELS FAILED";
-        if (error.message.includes("404")) failReason = "Models Not Found";
-        if (error.message.includes("429")) failReason = "Quota Exceeded";
-        
         return {
           rating: 0, exposure: 0, temp: 0, highlights: 0, shadows: 0, 
           whites: 0, blacks: 0, contrast: 0, 
-          reason: failReason, keywords: [], caption: ""
+          reason: "ALL MODELS FAILED", keywords: [], caption: ""
         };
       }
     }
   }
-
   return { rating: 0, exposure: 0, temp: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0, contrast: 0, reason: "LOOP ERROR", keywords: [], caption: "" };
 };
