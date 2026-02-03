@@ -17,11 +17,8 @@ export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> 
     };
   }
 
-  // 2. MODEL LIST: If one fails, we try the next.
-  // 'gemini-1.5-flash' = Standard Alias
-  // 'gemini-1.5-flash-001' = Specific Version (Often fixes 404s)
-  // 'gemini-1.5-flash-latest' = Bleeding Edge
-  // 'gemini-1.5-pro' = Heavy Duty Fallback
+  // 2. MODEL LIST: If one fails, the code automatically tries the next.
+  // This fixes the "404 Model Not Found" error you are seeing.
   const MODELS_TO_TRY = [
     "gemini-1.5-flash", 
     "gemini-1.5-flash-001", 
