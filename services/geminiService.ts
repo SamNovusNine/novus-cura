@@ -1,86 +1,114 @@
 import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from "@google/generative-ai";
 import { PhotoAnalysis } from "../types";
 
-// 1. CLEANER: Strips Markdown from response
+// 1. HELPER: Clean JSON
 const cleanJSON = (text: string): string => {
   return text.replace(/^```json\s*/, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
 };
 
 export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> => {
-  // 2. KEY CHECK: Reads the Vercel Variable
   const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
   
   if (!apiKey) {
-    console.error("API KEY MISSING. Check Vercel Settings.");
+    console.error("❌ API KEY MISSING");
     return {
       rating: 0, exposure: 0, temp: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0, contrast: 0,
-      reason: "MISSING KEY", keywords: [], caption: ""
+      reason: "MISSING API KEY", keywords: [], caption: ""
     };
   }
 
-  try {
-    // 3. INITIALIZE: Uses the correct @google/generative-ai class
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ 
-      model: "gemini-1.5-flash",
-      // Disable Safety Checks so it doesn't block people photos
-      safetySettings: [
-        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-      ]
-    });
+  // 2. MODEL LIST: If one fails, we try the next.
+  // 'gemini-1.5-flash' = Standard Alias
+  // 'gemini-1.5-flash-001' = Specific Version (Often fixes 404s)
+  // 'gemini-1.5-flash-latest' = Bleeding Edge
+  // 'gemini-1.5-pro' = Heavy Duty Fallback
+  const MODELS_TO_TRY = [
+    "gemini-1.5-flash", 
+    "gemini-1.5-flash-001", 
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro"
+  ];
 
-    const prompt = `
-      Act as a professional photo editor. Analyze this image.
-      Return a JSON object with this EXACT structure:
-      {
-        "rating": (Integer 0-5, 0=Reject, 5=Hero),
-        "reason": (String, short reason),
-        "exposure": (Number, EV offset),
-        "temp": (Number, WB offset),
-        "highlights": (Number),
-        "shadows": (Number),
-        "whites": (Number),
-        "blacks": (Number),
-        "contrast": (Number),
-        "keywords": [String array],
-        "caption": (String)
+  const genAI = new GoogleGenerativeAI(apiKey);
+  
+  // 3. THE PROMPT
+  const prompt = `
+    Act as a professional photo editor. Analyze this image.
+    Return a JSON object with this EXACT structure (no markdown):
+    {
+      "rating": (Integer 0-5, 0=Reject, 5=Hero),
+      "reason": (String, short technical reason),
+      "exposure": (Number, EV offset),
+      "temp": (Number, WB offset),
+      "highlights": (Number),
+      "shadows": (Number),
+      "whites": (Number),
+      "blacks": (Number),
+      "contrast": (Number),
+      "keywords": [String array],
+      "caption": (String)
+    }
+  `;
+
+  // 4. SELF-HEALING LOOP
+  for (const modelName of MODELS_TO_TRY) {
+    try {
+      console.log(`🤖 Attempting AI with model: ${modelName}...`);
+      
+      const model = genAI.getGenerativeModel({ 
+        model: modelName,
+        safetySettings: [
+          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        ]
+      });
+
+      const result = await model.generateContent([
+        prompt,
+        { inlineData: { data: base64Image, mimeType: "image/jpeg" } }
+      ]);
+
+      const response = await result.response;
+      const text = response.text();
+      const data = JSON.parse(cleanJSON(text));
+
+      console.log(`✅ SUCCESS with ${modelName}`);
+      
+      return {
+        rating: typeof data.rating === 'number' ? data.rating : 0,
+        exposure: data.exposure || 0,
+        temp: data.temp || 0,
+        highlights: data.highlights || 0,
+        shadows: data.shadows || 0,
+        whites: data.whites || 0,
+        blacks: data.blacks || 0,
+        contrast: data.contrast || 0,
+        reason: data.reason || `Analyzed by ${modelName}`,
+        keywords: Array.isArray(data.keywords) ? data.keywords : [],
+        caption: data.caption || ""
+      };
+
+    } catch (error: any) {
+      console.warn(`⚠️ Failed with ${modelName}:`, error.message);
+      
+      // If it's the last model and it still failed, return error
+      if (modelName === MODELS_TO_TRY[MODELS_TO_TRY.length - 1]) {
+        let failReason = "AI Failed";
+        if (error.message.includes("404")) failReason = "Models Not Found";
+        if (error.message.includes("429")) failReason = "Quota Exceeded";
+        if (error.message.includes("SAFETY")) failReason = "Safety Block";
+        
+        return {
+          rating: 0, exposure: 0, temp: 0, highlights: 0, shadows: 0, 
+          whites: 0, blacks: 0, contrast: 0, 
+          reason: failReason, keywords: [], caption: ""
+        };
       }
-    `;
-
-    const result = await model.generateContent([
-      prompt,
-      { inlineData: { data: base64Image, mimeType: "image/jpeg" } }
-    ]);
-
-    const response = await result.response;
-    const text = response.text();
-    
-    // Parse the clean JSON
-    const data = JSON.parse(cleanJSON(text));
-
-    return {
-      rating: typeof data.rating === 'number' ? data.rating : 0,
-      exposure: data.exposure || 0,
-      temp: data.temp || 0,
-      highlights: data.highlights || 0,
-      shadows: data.shadows || 0,
-      whites: data.whites || 0,
-      blacks: data.blacks || 0,
-      contrast: data.contrast || 0,
-      reason: data.reason || "Processed",
-      keywords: Array.isArray(data.keywords) ? data.keywords : [],
-      caption: data.caption || ""
-    };
-
-  } catch (error: any) {
-    console.error("AI FAILURE:", error);
-    return {
-      rating: 0, exposure: 0, temp: 0, highlights: 0, shadows: 0, 
-      whites: 0, blacks: 0, contrast: 0, 
-      reason: "AI ERROR", keywords: [], caption: ""
-    };
+      // Otherwise, continue loop to next model
+    }
   }
+
+  return { rating: 0, exposure: 0, temp: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0, contrast: 0, reason: "LOOP ERROR", keywords: [], caption: "" };
 };
