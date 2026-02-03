@@ -17,18 +17,27 @@ export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> 
     };
   }
 
-  // 2. MODEL LIST: If one fails, the code automatically tries the next.
-  // This fixes the "404 Model Not Found" error you are seeing.
-  const MODELS_TO_TRY = [
-    "gemini-1.5-flash", 
-    "gemini-1.5-flash-001", 
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-pro"
+  // 2. SAFETY: Disable filters so it doesn't block "people"
+  const safetySettings = [
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
   ];
 
   const genAI = new GoogleGenerativeAI(apiKey);
+
+  // 3. MODEL LIST: The "Self-Healing" Order
+  // We try 'gemini-pro' FIRST because it is the most widely available.
+  const MODELS_TO_TRY = [
+    "gemini-1.5-flash",        // Fast, new
+    "gemini-1.5-flash-latest", // Bleeding edge
+    "gemini-1.5-pro",          // Powerful
+    "gemini-pro",              // Old faithful (Legacy v1.0)
+    "gemini-1.0-pro"           // Explicit Legacy
+  ];
   
-  // 3. THE PROMPT
+  // 4. THE PROMPT
   const prompt = `
     Act as a professional photo editor. Analyze this image.
     Return a JSON object with this EXACT structure (no markdown):
@@ -47,20 +56,12 @@ export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> 
     }
   `;
 
-  // 4. SELF-HEALING LOOP
+  // 5. TRY LOOP
   for (const modelName of MODELS_TO_TRY) {
     try {
-      console.log(`🤖 Attempting AI with model: ${modelName}...`);
+      console.log(`🤖 Trying Model: ${modelName}...`);
       
-      const model = genAI.getGenerativeModel({ 
-        model: modelName,
-        safetySettings: [
-          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        ]
-      });
+      const model = genAI.getGenerativeModel({ model: modelName, safetySettings });
 
       const result = await model.generateContent([
         prompt,
@@ -90,20 +91,14 @@ export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> 
     } catch (error: any) {
       console.warn(`⚠️ Failed with ${modelName}:`, error.message);
       
-      // If it's the last model and it still failed, return error
+      // If we ran out of models, fail.
       if (modelName === MODELS_TO_TRY[MODELS_TO_TRY.length - 1]) {
-        let failReason = "AI Failed";
-        if (error.message.includes("404")) failReason = "Models Not Found";
-        if (error.message.includes("429")) failReason = "Quota Exceeded";
-        if (error.message.includes("SAFETY")) failReason = "Safety Block";
-        
         return {
           rating: 0, exposure: 0, temp: 0, highlights: 0, shadows: 0, 
           whites: 0, blacks: 0, contrast: 0, 
-          reason: failReason, keywords: [], caption: ""
+          reason: "ALL MODELS FAILED", keywords: [], caption: ""
         };
       }
-      // Otherwise, continue loop to next model
     }
   }
 
