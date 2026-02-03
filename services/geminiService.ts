@@ -19,27 +19,29 @@ const analysisSchema = {
   required: ["rating", "exposure", "reason", "keywords", "caption"],
 };
 
-// HELPER: Removes ```json ... ``` formatting so JSON.parse doesn't crash
+// Helper to clean Markdown like ```json ... ```
 const cleanJSON = (text: string): string => {
   return text.replace(/^```json\s*/, '').replace(/\s*```$/, '').trim();
 };
 
-const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-export const analyzePhoto = async (base64Image: string, attempt: number = 1): Promise<PhotoAnalysis> => {
-  const MAX_ATTEMPTS = 3;
-  // FIXED: Use the correct public model name
-  const MODEL_NAME = 'gemini-1.5-flash'; 
+export const analyzePhoto = async (base64Image: string): Promise<PhotoAnalysis> => {
+  // 1. Get the Key (Must match Vercel)
+  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+  
+  if (!apiKey) {
+    console.error("CRITICAL ERROR: API Key is missing.");
+    return {
+      rating: 0, exposure: 0, temp: 0, highlights: 0, shadows: 0, 
+      whites: 0, blacks: 0, contrast: 0, 
+      reason: "MISSING API KEY (Check Vercel Settings)", keywords: [], caption: ""
+    };
+  }
 
   try {
-    // Handle Vercel vs Local environment variables
-    const apiKey = import.meta.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY || process.env.API_KEY;
-    
-    if (!apiKey) throw new Error("Missing API Key. Add VITE_GEMINI_API_KEY to Vercel.");
-
     const ai = new GoogleGenAI({ apiKey });
+    // 2. Use the Correct Model
     const response = await ai.models.generateContent({
-      model: MODEL_NAME,
+      model: 'gemini-1.5-flash',
       contents: [
         {
           parts: [
@@ -57,9 +59,7 @@ export const analyzePhoto = async (base64Image: string, attempt: number = 1): Pr
     const rawText = response.text();
     if (!rawText) throw new Error("Empty response");
 
-    // Clean the text before parsing
-    const cleanedText = cleanJSON(rawText);
-    const result = JSON.parse(cleanedText);
+    const result = JSON.parse(cleanJSON(rawText));
 
     return {
       ...result,
@@ -68,19 +68,16 @@ export const analyzePhoto = async (base64Image: string, attempt: number = 1): Pr
 
   } catch (error: any) {
     console.error("AI Error:", error);
+    let failReason = "AI Analysis Failed";
     
-    // Retry on 429 (Rate Limit) or 503 (Overload)
-    const isRetryable = error?.status === 429 || error?.status === 503 || error?.message?.includes('429');
-
-    if (isRetryable && attempt < MAX_ATTEMPTS) {
-      await wait(2000 * attempt);
-      return analyzePhoto(base64Image, attempt + 1);
-    }
+    if (error.message?.includes("403")) failReason = "Invalid API Key";
+    if (error.message?.includes("404")) failReason = "Model Not Found";
+    if (error.message?.includes("429")) failReason = "Quota Exceeded";
 
     return {
       rating: 0, exposure: 0, temp: 0, highlights: 0, shadows: 0, 
       whites: 0, blacks: 0, contrast: 0, 
-      reason: "API_FAIL", keywords: [], caption: "Analysis Failed"
+      reason: failReason, keywords: [], caption: ""
     };
   }
 };
